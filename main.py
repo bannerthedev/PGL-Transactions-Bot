@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 import aiohttp
 import xml.etree.ElementTree as ET
+import dotenv
 
 import discord
 from discord.ext import commands
@@ -16,10 +17,12 @@ from discord import app_commands, Object
 from pathlib import Path
 from discord.ext import tasks
 from aiohttp import web
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 # ---------------- CONFIG ----------------
-BOT_TOKEN = "BOT TOKEN"
 TEST_GUILD_ID = 1409038531329917044
 
 # Channel IDs
@@ -93,15 +96,16 @@ DEFAULT_CONFIG = {
 }
 
 # ---------------- FILES ----------------
-TEAMS_FILE = Path("teams.json")
-PLAYER_HISTORY_FILE = Path("player_history.json")
-INVITES_FILE = Path("invites.json")
-ROSTER_LOCK_FILE = Path("roster_lock.json")
-CONFIG_FILE = Path("config.json")  # replace CONFIG_PATH
-YOUTUBE_STATE_FILE = Path("youtube_state.json")
-CODES_STATE_FILE = Path("codes_state.json")
-HEADSETS_FILE = Path("headsets.json")
-SEEDING_STATE_FILE = Path("seeding_state.json")
+data_dir = Path(os.getenv("data_file", "/data"))
+data_dir.mkdir(parents=True, exist_ok=True)
+
+TEAMS_FILE = data_dir / "teams.json"
+PLAYER_HISTORY_FILE = data_dir / "player_history.json"
+INVITES_FILE = data_dir / "invites.json"
+ROSTER_LOCK_FILE = data_dir / "roster_lock.json"
+CONFIG_FILE = data_dir / "config.json"
+CODES_STATE_FILE = data_dir / "codes_state.json"
+HEADSETS_FILE = data_dir / "headsets.json"
 
 
 
@@ -5633,4 +5637,4 @@ async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
 if __name__ == "__main__":
-    bot.run(BOT_TOKEN)
+    bot.run(os.getenv("BOT_TOKEN"))
