@@ -5300,128 +5300,6 @@ class ForfeitCog(commands.Cog):
 
 
 
-
-class TeamRoleAutoOrderCog(commands.Cog):
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
-        self._task.start()
-
-    def cog_unload(self):
-        self._task.cancel()
-
-    def _get_team_roles(self, guild: discord.Guild) -> list[discord.Role]:
-        """
-        Return all team roles that should be auto‑ordered, based on teams.json.
-
-        For each entry:
-        - Try to resolve by role_id.
-        - If that fails, fall back to resolving by name (case‑insensitive).
-        """
-        roles: list[discord.Role] = []
-        seen_ids: set[int] = set()
-
-        try:
-            teams = load_teams()
-        except Exception:
-            teams = []
-
-        for entry in teams:
-            rid = entry.get("role_id")
-            name = (entry.get("name") or "").strip()
-            role: discord.Role | None = None
-
-            # 1) Try by ID
-            if rid is not None:
-                try:
-                    rid_int = int(rid)
-                except (TypeError, ValueError):
-                    print(f"[TeamRoleAutoOrder] Invalid role_id in teams.json: {rid!r}")
-                    rid_int = None
-
-                if rid_int is not None:
-                    r = guild.get_role(rid_int)
-                    if r is None:
-                        print(f"[TeamRoleAutoOrder] Role id {rid_int} not found in guild {guild.id}")
-                    else:
-                        role = r
-
-            # 2) If not found by ID, try by name
-            if role is None and name:
-                r = (
-                    discord.utils.get(guild.roles, name=name)
-                    or discord.utils.find(lambda rr: rr.name.lower() == name.lower(), guild.roles)
-                )
-                if r:
-                    print(f"[TeamRoleAutoOrder] Matched team '{name}' by name to role id {r.id}")
-                    role = r
-
-            if role is None:
-                continue
-            if role.is_default() or role.managed:
-                print(f"[TeamRoleAutoOrder] Skipping managed/default role {role} ({role.id})")
-                continue
-            if role.id in seen_ids:
-                continue
-
-            seen_ids.add(role.id)
-            roles.append(role)
-
-        # Sort team roles by name so they appear in a clean, stable order
-        roles.sort(key=lambda r: r.name.lower())
-        return roles
-
-    async def _fix_roles_for_guild(self, guild: discord.Guild):
-        team_player_role = guild.get_role(TEAM_PLAYER_ROLE_ID)
-        if team_player_role is None:
-            return
-
-        me = guild.me
-        if not me or not me.guild_permissions.manage_roles:
-            return
-
-        team_roles = self._get_team_roles(guild)
-        if not team_roles:
-            return
-
-        # DEBUG: see which roles are being moved
-        debug_names = ", ".join(f"{r.name}({r.id})" for r in team_roles)
-        print(f"[TeamRoleAutoOrder] Guild {guild.id} team roles (ordered): {debug_names}")
-
-        # Put first team role just under Team Player, others stacked directly under it
-        # This guarantees a contiguous block: TEAM PLAYER, TEST1, TEST2, ... with no non‑team roles in between.
-        top_position = team_player_role.position - 1
-        if top_position < 1:
-            top_position = 1
-
-        role_positions: dict[discord.Role, int] = {}
-        current_pos = top_position
-        for r in team_roles:
-            role_positions[r] = current_pos
-            current_pos -= 1
-            if current_pos < 1:
-                current_pos = 1
-
-        try:
-            await guild.edit_role_positions(positions=role_positions)
-        except Exception as e:
-            print(f"[TeamRoleAutoOrder] edit_role_positions failed in guild {guild.id}: {e}")
-
-    @tasks.loop(minutes=2)
-    async def _task(self):
-        await self.bot.wait_until_ready()
-        for g in self.bot.guilds:
-            try:
-                await self._fix_roles_for_guild(g)
-            except Exception as e:
-                print(f"[TeamRoleAutoOrder] _fix_roles_for_guild error in {g.id}: {e}")
-                continue
-
-    @_task.before_loop
-    async def _before(self):
-        await self.bot.wait_until_ready()
-
-
-
 class RescrimCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -5601,9 +5479,7 @@ class MainBot(commands.Bot):
             "CommandGuideCog",
             "AutoCodeCog",
             "HeadsetInfoCog",
-            "TeamRoleAutoOrderCog",
             "RescrimCog",
-            "RoleOrderFixCog",
             "ScrimCheckCog"
             "ForfeitCog"
         ]
