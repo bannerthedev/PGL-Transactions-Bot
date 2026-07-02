@@ -4396,6 +4396,26 @@ class RosterCog(commands.Cog):
     def _is_team_role(self, guild: discord.Guild, role: discord.Role) -> bool:
         return is_team_role(guild, role)
 
+    def _build_roster_embed(self, role: discord.Role, data: dict) -> discord.Embed:
+        embed_color = role.colour if getattr(role, "colour", None) else discord.Color.dark_green()
+        embed = discord.Embed(
+            title=f"Roster for {data['name']}",
+            description="Team roster",
+            color=embed_color,
+        )
+        embed.add_field(name="Team Executive", value=format_list_arrow([data["executive"]]), inline=False)
+        embed.add_field(name="Captain", value=format_list_arrow([data["captain"]]), inline=False)
+        embed.add_field(name="Co-Captains", value=format_list_arrow(data.get("co_captains", [])), inline=False)
+        players = data.get("players", [])
+        player_mentions = [p.mention for p in players[: CONFIG.get("roster_rules", {}).get("max_roster", 12)]]
+        embed.add_field(name="Players", value=format_list_arrow(player_mentions), inline=False)
+        embed.add_field(name="\u200b", value=f"{len(players)}/{CONFIG.get('roster_rules', {}).get('max_roster', 12)}", inline=False)
+        pending = data.get("pending_invites", [])
+        pending_text = ", ".join(str(x) for x in pending) if pending else "None"
+        embed.add_field(name="Pending invites", value=pending_text, inline=False)
+        embed.set_footer(text=role.name)
+        return embed
+
     @app_commands.guilds(Object(id=TEST_GUILD_ID))
     @app_commands.command(name="roster", description="Show a team's roster")
     async def roster(self, interaction: discord.Interaction):
@@ -4404,53 +4424,74 @@ class RosterCog(commands.Cog):
             await interaction.response.send_message("Use this in a server.", ephemeral=True)
             return
 
-        # Prefer the caller's team if they have one
-        member = interaction.user
+        member = guild.get_member(interaction.user.id) or interaction.user
         team_role = get_user_team_role(member)
 
-        # Fallback: first detected team role in the guild
-        if team_role is None:
-            protected = {
-                CAPTAIN_ROLE_ID, CO_CAPTAIN_ROLE_ID, TEAM_PLAYER_ROLE_ID, TEAM_EXEC_ROLE_ID,
-                HEAD_REF_ROLE_ID, REF_ROLE_ID, HEAD_CASTER_ROLE_ID, CASTER_ROLE_ID,
-             UNBORN_CAPTAIN_ROLE_ID, EVENT_PING_ROLE_ID,
-            }
-            candidate_roles = [
-                r for r in guild.roles
-                if not r.is_default() and not r.managed and r.id not in protected
-            ]
-            teams = [r for r in candidate_roles if is_team_role(guild, r)]
-            team_role = teams[0] if teams else None
+        # If caller has a team, show it immediately (no select)
+        if team_role:
+            data = await get_team_data(team_role, guild)
+            embed = self._build_roster_embed(team_role, data)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
 
-        if team_role is None:
+        # Build list of team roles from teams.json
+        roles: list[discord.Role] = []
+        teams_data = load_teams()
+        for entry in teams_data:
+            rid = entry.get("role_id")
+            if not rid:
+                continue
+            try:
+                rid_int = int(rid)
+            except Exception:
+                continue
+            r = guild.get_role(rid_int)
+            if r and not r.is_default() and not r.managed and is_team_role(guild, r):
+                roles.append(r)
+
+        if not roles:
             await interaction.response.send_message("No teams found.", ephemeral=True)
             return
 
-        data = await get_team_data(team_role, guild)
+        # If only one team found, show it directly
+        if len(roles) == 1:
+            role = roles[0]
+            data = await get_team_data(role, guild)
+            embed = self._build_roster_embed(role, data)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
 
-        embed_color = team_role.colour if getattr(team_role, "colour", None) else discord.Color.dark_green()
-        embed = discord.Embed(
-            title=f"Roster for {data['name']}",
-            description="Team roster",
-            color=embed_color,
-        )
+        # Multiple teams: present a Select dropdown (max 25 options)
+        options = [discord.SelectOption(label=r.name, value=str(r.id)) for r in roles][:25]
+        select = discord.ui.Select(placeholder="Select a team to view its roster", options=options, min_values=1, max_values=1)
+        view = discord.ui.View(timeout=120)
+        view.add_item(select)
 
-        # uses the same formatter as /manage-team and /admin-manage
-        embed.add_field(name="Team Executive", value=format_list_arrow([data["executive"]]), inline=False)
-        embed.add_field(name="Captain",        value=format_list_arrow([data["captain"]]),   inline=False)
-        embed.add_field(name="Co-Captains",    value=format_list_arrow(data.get("co_captains", [])), inline=False)
+        async def sel_cb(sel_int: discord.Interaction):
+            # Grab selected role
+            try:
+                sel_role_id = int(sel_int.data["values"][0])
+            except Exception:
+                await sel_int.response.send_message("Invalid selection.", ephemeral=True)
+                return
+            sel_role = guild.get_role(sel_role_id)
+            if not sel_role:
+                await sel_int.response.send_message("Role not found.", ephemeral=True)
+                return
 
-        players = data.get("players", [])
-        player_mentions = [p.mention for p in players[:12]]
-        embed.add_field(name="Players", value=format_list_arrow(player_mentions), inline=False)
+            data = await get_team_data(sel_role, guild)
+            embed = self._build_roster_embed(sel_role, data)
 
-        embed.add_field(name="\u200b", value=f"{len(players)}/12", inline=False)
-        pending = data.get("pending_invites", [])
-        pending_text = ", ".join(str(x) for x in pending) if pending else "None"
-        embed.add_field(name="Pending invites", value=pending_text, inline=False)
-        embed.set_footer(text=team_role.name)
+            # Edit the original message so the select remains underneath
+            try:
+                await sel_int.response.edit_message(embed=embed, view=view)
+            except Exception:
+                # fallback: send ephemeral reply
+                await sel_int.response.send_message(embed=embed, ephemeral=True)
 
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        select.callback = sel_cb
+        await interaction.response.send_message("Pick a team to view its roster:", view=view, ephemeral=True)
+
 
 
 from discord import app_commands
