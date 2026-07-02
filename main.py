@@ -4397,22 +4397,28 @@ class RosterCog(commands.Cog):
         return is_team_role(guild, role)
 
     def _build_roster_embed(self, role: discord.Role, data: dict) -> discord.Embed:
+        max_roster = CONFIG.get("roster_rules", {}).get("max_roster", 12)
         embed_color = role.colour if getattr(role, "colour", None) else discord.Color.dark_green()
+
         embed = discord.Embed(
             title=f"Roster for {data['name']}",
             description="Team roster",
             color=embed_color,
         )
+
         embed.add_field(name="Team Executive", value=format_list_arrow([data["executive"]]), inline=False)
-        embed.add_field(name="Captain", value=format_list_arrow([data["captain"]]), inline=False)
-        embed.add_field(name="Co-Captains", value=format_list_arrow(data.get("co_captains", [])), inline=False)
+        embed.add_field(name="Captain",        value=format_list_arrow([data["captain"]]),   inline=False)
+        embed.add_field(name="Co-Captains",    value=format_list_arrow(data.get("co_captains", [])), inline=False)
+
         players = data.get("players", [])
-        player_mentions = [p.mention for p in players[: CONFIG.get("roster_rules", {}).get("max_roster", 12)]]
+        player_mentions = [p.mention for p in players[:max_roster]]
         embed.add_field(name="Players", value=format_list_arrow(player_mentions), inline=False)
-        embed.add_field(name="\u200b", value=f"{len(players)}/{CONFIG.get('roster_rules', {}).get('max_roster', 12)}", inline=False)
+        embed.add_field(name="\u200b", value=f"{len(players)}/{max_roster}", inline=False)
+
         pending = data.get("pending_invites", [])
         pending_text = ", ".join(str(x) for x in pending) if pending else "None"
         embed.add_field(name="Pending invites", value=pending_text, inline=False)
+
         embed.set_footer(text=role.name)
         return embed
 
@@ -4420,21 +4426,21 @@ class RosterCog(commands.Cog):
     @app_commands.command(name="roster", description="Show a team's roster")
     async def roster(self, interaction: discord.Interaction):
         guild = interaction.guild
-        if not guild:
+        if guild is None:
             await interaction.response.send_message("Use this in a server.", ephemeral=True)
             return
 
         member = guild.get_member(interaction.user.id) or interaction.user
         team_role = get_user_team_role(member)
 
-        # If caller has a team, show it immediately (no select)
+        # 1) If caller has a team, just show that roster
         if team_role:
             data = await get_team_data(team_role, guild)
             embed = self._build_roster_embed(team_role, data)
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
-        # Build list of team roles from teams.json
+        # 2) Build list of team roles from teams.json that still exist and look like team roles
         roles: list[discord.Role] = []
         teams_data = load_teams()
         for entry in teams_data:
@@ -4453,7 +4459,7 @@ class RosterCog(commands.Cog):
             await interaction.response.send_message("No teams found.", ephemeral=True)
             return
 
-        # If only one team found, show it directly
+        # If only one team, show it directly
         if len(roles) == 1:
             role = roles[0]
             data = await get_team_data(role, guild)
@@ -4461,19 +4467,25 @@ class RosterCog(commands.Cog):
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
-        # Multiple teams: present a Select dropdown (max 25 options)
+        # 3) Multiple teams -> dropdown, updating the same message
         options = [discord.SelectOption(label=r.name, value=str(r.id)) for r in roles][:25]
-        select = discord.ui.Select(placeholder="Select a team to view its roster", options=options, min_values=1, max_values=1)
+        select = discord.ui.Select(
+            placeholder="Select a team to view its roster",
+            options=options,
+            min_values=1,
+            max_values=1,
+        )
         view = discord.ui.View(timeout=120)
         view.add_item(select)
 
         async def sel_cb(sel_int: discord.Interaction):
-            # Grab selected role
+            # This callback runs when a user picks a team from the dropdown
             try:
                 sel_role_id = int(sel_int.data["values"][0])
             except Exception:
                 await sel_int.response.send_message("Invalid selection.", ephemeral=True)
                 return
+
             sel_role = guild.get_role(sel_role_id)
             if not sel_role:
                 await sel_int.response.send_message("Role not found.", ephemeral=True)
@@ -4482,15 +4494,20 @@ class RosterCog(commands.Cog):
             data = await get_team_data(sel_role, guild)
             embed = self._build_roster_embed(sel_role, data)
 
-            # Edit the original message so the select remains underneath
+            # Edit the original ephemeral message so the dropdown stays under the updated embed
             try:
                 await sel_int.response.edit_message(embed=embed, view=view)
             except Exception:
-                # fallback: send ephemeral reply
+                # fallback if edit fails
                 await sel_int.response.send_message(embed=embed, ephemeral=True)
 
         select.callback = sel_cb
-        await interaction.response.send_message("Pick a team to view its roster:", view=view, ephemeral=True)
+
+        await interaction.response.send_message(
+            "Pick a team to view its roster:",
+            view=view,
+            ephemeral=True,
+        )
 
 
 
@@ -5499,52 +5516,52 @@ class MainBot(commands.Bot):
         super().__init__(command_prefix="!", intents=INTENTS)
         self._web_runner: web.AppRunner | None = None
 
-async def setup_hook(self):
-    guild_obj = Object(id=TEST_GUILD_ID)
-    cog_names = [
-        "SettingsCog",
-        "AdminPanel",
-        "ManageTeam",
-        "DoneCommand",
-        "RosterCog",
-        "InfoCommands",
-        "AdminManage",
-        "FAQBracketCog",
-        "StandingCog",
-        "SchedulingAdmin",
-        "BracketAdmin",
-        "LeaveCog",
-        "AutoDisbandScrim",
-        "SaySomethingCog",
-        "ForceTimeCog",
-        "CommandGuideCog",
-        "AutoCodeCog",
-        "HeadsetInfoCog",
-        "RescrimCog",
-        "ScrimCheckCog",
-        "ForfeitCog",
-    ]
+    async def setup_hook(self):
+        guild_obj = Object(id=TEST_GUILD_ID)
+        cog_names = [
+            "SettingsCog",
+            "AdminPanel",
+            "ManageTeam",
+            "DoneCommand",
+            "RosterCog",          # <-- this must match the class name above
+            "InfoCommands",
+            "AdminManage",
+            "FAQBracketCog",
+            "StandingCog",
+            "SchedulingAdmin",
+            "BracketAdmin",
+            "LeaveCog",
+            "AutoDisbandScrim",
+            "SaySomethingCog",
+            "ForceTimeCog",
+            "CommandGuideCog",
+            "AutoCodeCog",
+            "HeadsetInfoCog",
+            "RescrimCog",
+            "ScrimCheckCog",
+            "ForfeitCog",
+        ]
 
-    for name in cog_names:
-        cls = globals().get(name)
-        if cls is None:
-            print(f"Skipping cog {name}: not defined")
-            continue
+        for name in cog_names:
+            cls = globals().get(name)
+            if cls is None:
+                print(f"Skipping cog {name}: not defined")
+                continue
+            try:
+                await self.add_cog(cls(self))
+                print(f"Added cog: {name}")
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                print(f"Failed to add cog: {name}")
+
         try:
-            await self.add_cog(cls(self))
-            print(f"Added cog: {name}")
+            await self.tree.sync(guild=guild_obj)
+            print("Commands synced.")
         except Exception:
             import traceback
             traceback.print_exc()
-            print(f"Failed to add cog: {name}")
-
-    try:
-        await self.tree.sync(guild=guild_obj)
-        print("Commands synced.")
-    except Exception:
-        import traceback
-        traceback.print_exc()
-        print("Failed to sync commands.")
+            print("Failed to sync commands.")
 
 
 
