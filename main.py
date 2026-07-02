@@ -5499,52 +5499,53 @@ class MainBot(commands.Bot):
         super().__init__(command_prefix="!", intents=INTENTS)
         self._web_runner: web.AppRunner | None = None
 
-    async def setup_hook(self):
-        guild_obj = Object(id=TEST_GUILD_ID)
-        cog_names = [
-            "SettingsCog",
-            "AdminPanel",
-            "ManageTeam",
-            "DoneCommand",
-            "RosterCog",
-            "InfoCommands",
-            "AdminManage",
-            "FAQBracketCog",
-            "StandingCog",
-            "SchedulingAdmin",
-            "BracketAdmin",
-            "LeaveCog",
-            "AutoDisbandScrim",
-            "SaySomethingCog",
-            "ForceTimeCog",
-            "CommandGuideCog",
-            "AutoCodeCog",
-            "HeadsetInfoCog",
-            "RescrimCog",
-            "ScrimCheckCog"
-            "ForfeitCog"
-        ]
+async def setup_hook(self):
+    guild_obj = Object(id=TEST_GUILD_ID)
+    cog_names = [
+        "SettingsCog",
+        "AdminPanel",
+        "ManageTeam",
+        "DoneCommand",
+        "RosterCog",
+        "InfoCommands",
+        "AdminManage",
+        "FAQBracketCog",
+        "StandingCog",
+        "SchedulingAdmin",
+        "BracketAdmin",
+        "LeaveCog",
+        "AutoDisbandScrim",
+        "SaySomethingCog",
+        "ForceTimeCog",
+        "CommandGuideCog",
+        "AutoCodeCog",
+        "HeadsetInfoCog",
+        "RescrimCog",
+        "ScrimCheckCog",
+        "ForfeitCog",
+    ]
 
-        for name in cog_names:
-            cls = globals().get(name)
-            if cls is None:
-                print(f"Skipping cog {name}: not defined")
-                continue
-            try:
-                await self.add_cog(cls(self))
-                print(f"Added cog: {name}")
-            except Exception:
-                import traceback
-                traceback.print_exc()
-                print(f"Failed to add cog: {name}")
-
+    for name in cog_names:
+        cls = globals().get(name)
+        if cls is None:
+            print(f"Skipping cog {name}: not defined")
+            continue
         try:
-            await self.tree.sync(guild=guild_obj)
-            print("Commands synced.")
+            await self.add_cog(cls(self))
+            print(f"Added cog: {name}")
         except Exception:
             import traceback
             traceback.print_exc()
-            print("Failed to sync commands.")
+            print(f"Failed to add cog: {name}")
+
+    try:
+        await self.tree.sync(guild=guild_obj)
+        print("Commands synced.")
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        print("Failed to sync commands.")
+
 
 
 bot = MainBot()
