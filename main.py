@@ -4430,17 +4430,9 @@ class RosterCog(commands.Cog):
             await interaction.response.send_message("Use this in a server.", ephemeral=True)
             return
 
-        member = guild.get_member(interaction.user.id) or interaction.user
-        team_role = get_user_team_role(member)
+        await interaction.response.defer(ephemeral=True)
 
-        # 1) If caller has a team, just show that roster
-        if team_role:
-            data = await get_team_data(team_role, guild)
-            embed = self._build_roster_embed(team_role, data)
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
-
-        # 2) Build list of team roles from teams.json that still exist and look like team roles
+        # Build list of team roles from teams.json that still exist and look like team roles
         roles: list[discord.Role] = []
         teams_data = load_teams()
         for entry in teams_data:
@@ -4456,18 +4448,36 @@ class RosterCog(commands.Cog):
                 roles.append(r)
 
         if not roles:
-            await interaction.response.send_message("No teams found.", ephemeral=True)
+            await interaction.followup.send("No teams found.", ephemeral=True)
             return
 
-        # If only one team, show it directly
-        if len(roles) == 1:
-            role = roles[0]
-            data = await get_team_data(role, guild)
-            embed = self._build_roster_embed(role, data)
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
+        # helper to build embed for a role
+        def build_embed_for_role(role: discord.Role, data: dict) -> discord.Embed:
+            max_roster = CONFIG.get("roster_rules", {}).get("max_roster", 12)
+            embed_color = role.colour if getattr(role, "colour", None) else discord.Color.dark_green()
 
-        # 3) Multiple teams -> dropdown, updating the same message
+            embed = discord.Embed(
+                title=f"Roster for {data['name']}",
+                description="Team roster",
+                color=embed_color,
+            )
+
+            embed.add_field(name="Team Executive", value=format_list_arrow([data["executive"]]), inline=False)
+            embed.add_field(name="Captain",        value=format_list_arrow([data["captain"]]),   inline=False)
+            embed.add_field(name="Co-Captains",    value=format_list_arrow(data.get("co_captains", [])), inline=False)
+
+            players = data.get("players", [])
+            player_mentions = [p.mention for p in players[:max_roster]]
+            embed.add_field(name="Players", value=format_list_arrow(player_mentions), inline=False)
+            embed.add_field(name="\u200b", value=f"{len(players)}/{max_roster}", inline=False)
+
+            pending = data.get("pending_invites", [])
+            pending_text = ", ".join(str(x) for x in pending) if pending else "None"
+            embed.add_field(name="Pending invites", value=pending_text, inline=False)
+
+            embed.set_footer(text=role.name)
+            return embed
+
         options = [discord.SelectOption(label=r.name, value=str(r.id)) for r in roles][:25]
         select = discord.ui.Select(
             placeholder="Select a team to view its roster",
@@ -4479,7 +4489,6 @@ class RosterCog(commands.Cog):
         view.add_item(select)
 
         async def sel_cb(sel_int: discord.Interaction):
-            # This callback runs when a user picks a team from the dropdown
             try:
                 sel_role_id = int(sel_int.data["values"][0])
             except Exception:
@@ -4492,22 +4501,28 @@ class RosterCog(commands.Cog):
                 return
 
             data = await get_team_data(sel_role, guild)
-            embed = self._build_roster_embed(sel_role, data)
+            embed = build_embed_for_role(sel_role, data)
 
             # Edit the original ephemeral message so the dropdown stays under the updated embed
             try:
                 await sel_int.response.edit_message(embed=embed, view=view)
             except Exception:
-                # fallback if edit fails
                 await sel_int.response.send_message(embed=embed, ephemeral=True)
 
         select.callback = sel_cb
 
-        await interaction.response.send_message(
-            "Pick a team to view its roster:",
-            view=view,
-            ephemeral=True,
-        )
+        # If the requester is on a team, we can pre-select it (optional)
+        requester = guild.get_member(interaction.user.id)
+        requester_team = find_single_team_for_member(guild, requester) if requester else None
+        if requester_team:
+            # put their team first in the dropdown by reordering options
+            options_sorted = sorted(options, key=lambda o: (0 if o.value == str(requester_team.id) else 1, o.label.lower()))
+            select.options = options_sorted
+
+        # initial embed: prompt user to pick a team
+        prompt_embed = discord.Embed(title="Pick a team", description="Select a team from the dropdown to view its roster.", color=discord.Color.dark_green())
+
+        await interaction.followup.send(embed=prompt_embed, view=view, ephemeral=True)
 
 
 
