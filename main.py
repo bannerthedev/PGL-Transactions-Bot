@@ -26,11 +26,18 @@ load_dotenv()
 TEST_GUILD_ID = 1409038531329917044
 
 # Channel IDs
+# Channel IDs
 TRANSACTIONS_CHANNEL_ID = 1416462357718241410
 TRANSACTIONS_HELP_CHANNEL_ID = 1426624895722197193
 MATCH_SCORE_CHANNEL_ID = 1409043896989777982
 MATCH_TIMES_CHANNEL_ID = 1409044495743582268
 ASSIGNMENTS_CHANNEL_ID = 1454349005202002012
+
+# NEW:
+REF_ASSIGNMENTS_CHANNEL_ID = 1524533755622981642       # put your #ref-assignments channel ID here
+CASTER_ASSIGNMENTS_CHANNEL_ID = 1524533429515980900    # put your #caster-assignments channel ID here
+COMMENTATOR_ASSIGNMENTS_CHANNEL_ID = 1524534102957752520  # optional separate channel, or reuse caster
+
 SCRIM_CATEGORY_ID = 1410590393527046275
 SEEDING_POINTS_CHANNEL_ID = 1517019335846006784  # <- replace 0 with your seeding-points channel ID
 
@@ -2914,8 +2921,57 @@ class AssignmentClaimView(discord.ui.View):
         self.time = time
         self.team1_name = team1_name
         self.team2_name = team2_name
+
         self.caster: Optional[discord.Member] = None
         self.referee: Optional[discord.Member] = None
+        # Up to 2 commentators
+        self.commentators: list[discord.Member] = []
+
+    # ---------- helpers ----------
+
+    def _is_finals_or_semis(self) -> bool:
+        w = (self.week or "").lower()
+        return "final" in w or "semi" in w
+
+    def _is_head_staff(self, m: discord.Member) -> bool:
+        return has_role_id(m, HEAD_REF_ROLE_ID) or has_role_id(m, HEAD_CASTER_ROLE_ID)
+
+    def _is_ref_staff(self, m: discord.Member) -> bool:
+        return has_role_id(m, REF_ROLE_ID) or has_role_id(m, HEAD_REF_ROLE_ID)
+
+    def _is_caster_staff(self, m: discord.Member) -> bool:
+        return has_role_id(m, CASTER_ROLE_ID) or has_role_id(m, HEAD_CASTER_ROLE_ID)
+
+    def _can_override(self, new: discord.Member, old: Optional[discord.Member]) -> bool:
+        """
+        Override rules (only used in Semis/Finals):
+        - If there is no old: always ok.
+        - If new is head staff and old is NOT head staff: allowed (override).
+        - If old is head staff and new is not: not allowed.
+        - If both head staff and different members: not allowed.
+        - If same member: allowed (no change).
+        """
+        if old is None:
+            return True
+        if new.id == old.id:
+            return True
+
+        new_is_head = self._is_head_staff(new)
+        old_is_head = self._is_head_staff(old)
+
+        if not self._is_finals_or_semis():
+            # Outside Finals/Semis we do not allow overrides; first claim wins
+            return False
+
+        if new_is_head and not old_is_head:
+            return True
+        if old_is_head and not new_is_head:
+            return False
+        if new_is_head and old_is_head:
+            return False  # head vs head -> no override
+
+        # both normal staff, finals/semis -> no override
+        return False
 
     async def _find_message_to_edit(self, channel: discord.TextChannel) -> Optional[discord.Message]:
         if channel is None:
@@ -2957,9 +3013,13 @@ class AssignmentClaimView(discord.ui.View):
 
         match_times = guild.get_channel(MATCH_TIMES_CHANNEL_ID)
         assignments = guild.get_channel(ASSIGNMENTS_CHANNEL_ID)
+        ref_assign_ch = guild.get_channel(REF_ASSIGNMENTS_CHANNEL_ID)
+        caster_assign_ch = guild.get_channel(CASTER_ASSIGNMENTS_CHANNEL_ID)
+        comment_assign_ch = guild.get_channel(COMMENTATOR_ASSIGNMENTS_CHANNEL_ID)
 
         caster_text = self.caster.mention if self.caster else ""
         ref_text = self.referee.mention if self.referee else ""
+        comm_text = " ".join(m.mention for m in self.commentators) if self.commentators else ""
 
         stage_l = (self.week or "").lower()
         if "final" in stage_l:
@@ -2972,13 +3032,15 @@ class AssignmentClaimView(discord.ui.View):
             header = None
             special = False
 
+        # ---- MATCH_TIMES content ----
         if special:
             mt_content = (
                 f"{header}\n"
                 f"> Teams: {self.team1_name} vs {self.team2_name}\n"
                 f"> Time: {self.time}\n"
                 f"> Referee: {ref_text}\n"
-                f"> Caster: {caster_text}"
+                f"> Caster: {caster_text}\n"
+                f"> Commentator: {comm_text}"
             )
         else:
             mt_content = (
@@ -2986,7 +3048,8 @@ class AssignmentClaimView(discord.ui.View):
                 f"> WEEK: {self.week}\n"
                 f"> Time: {self.time}\n"
                 f"> Referee: {ref_text}\n"
-                f"> Caster: {caster_text}"
+                f"> Caster: {caster_text}\n"
+                f"> Commentator: {comm_text}"
             )
 
         if isinstance(match_times, discord.TextChannel):
@@ -2997,6 +3060,7 @@ class AssignmentClaimView(discord.ui.View):
             except Exception:
                 pass
 
+        # ---- ASSIGNMENTS content ----
         staff_mentions = []
         for rid in (HEAD_REF_ROLE_ID, REF_ROLE_ID, HEAD_CASTER_ROLE_ID, CASTER_ROLE_ID):
             r = guild.get_role(rid)
@@ -3011,7 +3075,8 @@ class AssignmentClaimView(discord.ui.View):
                 f"> Teams: {self.team1_name} vs {self.team2_name}\n"
                 f"> Time: {self.time}\n"
                 f"> Referee: {ref_text}\n"
-                f"> Caster: {caster_text}"
+                f"> Caster: {caster_text}\n"
+                f"> Commentator: {comm_text}"
             )
         else:
             as_content = (
@@ -3020,7 +3085,8 @@ class AssignmentClaimView(discord.ui.View):
                 f"> WEEK: {self.week}\n"
                 f"> Time: {self.time}\n"
                 f"> Referee: {ref_text}\n"
-                f"> Caster: {caster_text}"
+                f"> Caster: {caster_text}\n"
+                f"> Commentator: {comm_text}"
             )
 
         if isinstance(assignments, discord.TextChannel):
@@ -3031,104 +3097,172 @@ class AssignmentClaimView(discord.ui.View):
             except Exception:
                 pass
 
-        staff_mentions = []
-        for rid in (HEAD_REF_ROLE_ID, REF_ROLE_ID, HEAD_CASTER_ROLE_ID, CASTER_ROLE_ID):
-            r = guild.get_role(rid)
-            if r:
-                staff_mentions.append(r.mention)
-        staff_header = " ".join(staff_mentions)
+        # ---- Per-role assignment channels ----
 
-        as_content = (
-            f"{staff_header}\n"
-            f"{self.team1_name} vs {self.team2_name}\n"
-            f"> WEEK: {self.week}\n"
-            f"> Time: {self.time}\n"
-            f"> referee: {ref_text}\n"
-            f"> Caster: {caster_text}"
-        )
-        if isinstance(assignments, discord.TextChannel):
-            as_msg = await self._find_message_to_edit(assignments)
+        # Ref-only
+        if isinstance(ref_assign_ch, discord.TextChannel):
+            ref_content = (
+                f"{self.team1_name} vs {self.team2_name}\n"
+                f"> WEEK: {self.week}\n"
+                f"> Time: {self.time}\n"
+                f"> Referee: {ref_text}"
+            )
             try:
-                if as_msg:
-                    await as_msg.edit(content=as_content, view=self)
+                await ref_assign_ch.send(ref_content)
             except Exception:
                 pass
+
+        # Caster-only
+        if isinstance(caster_assign_ch, discord.TextChannel):
+            caster_content = (
+                f"{self.team1_name} vs {self.team2_name}\n"
+                f"> WEEK: {self.week}\n"
+                f"> Time: {self.time}\n"
+                f"> Caster: {caster_text}"
+            )
+            try:
+                await caster_assign_ch.send(caster_content)
+            except Exception:
+                pass
+
+        # Commentator-only
+        if isinstance(comment_assign_ch, discord.TextChannel):
+            comm_content = (
+                f"{self.team1_name} vs {self.team2_name}\n"
+                f"> WEEK: {self.week}\n"
+                f"> Time: {self.time}\n"
+                f"> Commentator: {comm_text}"
+            )
+            try:
+                await comment_assign_ch.send(comm_content)
+            except Exception:
+                pass
+
+    # ---------- buttons ----------
 
     @discord.ui.button(label="Claim Caster", style=discord.ButtonStyle.primary)
     async def claim_caster(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # allow only for FINALS and only head casters / head refs / senior refs
-        user = interaction.user
         guild = interaction.guild
+        user = interaction.user
+
         if guild is None:
             await interaction.response.send_message("Use this in a server.", ephemeral=True)
             return
 
-        # finals-only
-        if "final" not in (self.week or "").lower():
-            await interaction.response.send_message("Caster claiming is only allowed for Finals.", ephemeral=True)
+        # must be caster staff
+        if not self._is_caster_staff(user):
+            await interaction.response.send_message("You must be caster staff to claim Caster.", ephemeral=True)
             return
 
-        allowed = any(has_role_id(user, rid) for rid in (HEAD_CASTER_ROLE_ID, HEAD_REF_ROLE_ID, REF_ROLE_ID))
-        if not allowed:
-            await interaction.response.send_message("Only head casters, head refs, or senior refs may claim Caster for Finals.", ephemeral=True)
+        old = self.caster
+        if old is not None and not self._can_override(user, old):
+            await interaction.response.send_message("You cannot override the current Caster for this match.", ephemeral=True)
             return
 
-        prev = self.caster
         self.caster = user
 
-        button.disabled = True
         await interaction.response.send_message("You claimed Caster.", ephemeral=True)
-        if prev and prev != user:
+        if old and old != user:
             try:
-                await prev.send(f"You were unclaimed as Caster for {self.team1_name} vs {self.team2_name}.")
+                await old.send(f"You were unclaimed as Caster for {self.team1_name} vs {self.team2_name}.")
             except Exception:
                 pass
 
         await self._update_messages(interaction)
-
 
     @discord.ui.button(label="Claim Referee", style=discord.ButtonStyle.primary)
     async def claim_ref(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # allow only for FINALS and only head casters / head refs / senior refs
-        user = interaction.user
         guild = interaction.guild
+        user = interaction.user
+
         if guild is None:
             await interaction.response.send_message("Use this in a server.", ephemeral=True)
             return
 
-        # finals-only
-        if "final" not in (self.week or "").lower():
-            await interaction.response.send_message("Referee claiming is only allowed for Finals.", ephemeral=True)
+        # must be ref staff
+        if not self._is_ref_staff(user):
+            await interaction.response.send_message("You must be referee staff to claim Referee.", ephemeral=True)
             return
 
-        allowed = any(has_role_id(user, rid) for rid in (HEAD_CASTER_ROLE_ID, HEAD_REF_ROLE_ID, REF_ROLE_ID))
-        if not allowed:
-            await interaction.response.send_message("Only head casters, head refs, or senior refs may claim Referee for Finals.", ephemeral=True)
+        old = self.referee
+        if old is not None and not self._can_override(user, old):
+            await interaction.response.send_message("You cannot override the current Referee for this match.", ephemeral=True)
             return
 
-        prev = self.referee
         self.referee = user
 
-        button.disabled = True
         await interaction.response.send_message("You claimed Referee.", ephemeral=True)
-        if prev and prev != user:
+        if old and old != user:
             try:
-                await prev.send(f"You were unclaimed as Referee for {self.team1_name} vs {self.team2_name}.")
+                await old.send(f"You were unclaimed as Referee for {self.team1_name} vs {self.team2_name}.")
             except Exception:
                 pass
 
         await self._update_messages(interaction)
 
-    @discord.ui.button(label="Unclaim", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Claim Commentator", style=discord.ButtonStyle.secondary)
+    async def claim_commentator(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        user = interaction.user
+
+        if guild is None:
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            return
+
+        # Use caster staff for commentators as well
+        if not self._is_caster_staff(user):
+            await interaction.response.send_message("You must be caster staff to claim Commentator.", ephemeral=True)
+            return
+
+        # Free slot (max 2)
+        if len(self.commentators) < 2 and user not in self.commentators:
+            self.commentators.append(user)
+            await interaction.response.send_message("You claimed Commentator.", ephemeral=True)
+            await self._update_messages(interaction)
+            return
+
+        # already commentator
+        if user in self.commentators:
+            await interaction.response.send_message("You are already a Commentator for this match.", ephemeral=True)
+            return
+
+        # full (2 commentators) -> override rules in finals/semis only, by head staff only
+        if not self._is_finals_or_semis():
+            await interaction.response.send_message("There are already two commentators for this match.", ephemeral=True)
+            return
+
+        if not self._is_head_staff(user):
+            await interaction.response.send_message("There are already two commentators for this match.", ephemeral=True)
+            return
+
+        overridden = None
+        for old in list(self.commentators):
+            if not self._is_head_staff(old):
+                overridden = old
+                break
+
+        if overridden is None:
+            await interaction.response.send_message("There are already two head commentators for this match.", ephemeral=True)
+            return
+
+        self.commentators.remove(overridden)
+        self.commentators.append(user)
+
+        await interaction.response.send_message("You claimed Commentator (override).", ephemeral=True)
+        try:
+            await overridden.send(f"You were unclaimed as Commentator for {self.team1_name} vs {self.team2_name}.")
+        except Exception:
+            pass
+
+        await self._update_messages(interaction)
+
+    @discord.ui.button(label="Unclaim All", style=discord.ButtonStyle.danger)
     async def unclaim(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Clear both claims; Unclaim button stays enabled
         self.caster = None
         self.referee = None
-        # Re-enable claim buttons on this view instance (they will be re-rendered enabled)
-        for child in self.children:
-            if isinstance(child, discord.ui.Button) and child.label in ("Claim Caster", "Claim Referee"):
-                child.disabled = False
-        await interaction.response.send_message("Claims cleared.", ephemeral=True)
+        self.commentators.clear()
+
+        await interaction.response.send_message("All claims cleared.", ephemeral=True)
         await self._update_messages(interaction)
 
 
@@ -3595,7 +3729,8 @@ class SubmitTimeModal(discord.ui.Modal, title="Submit Match Time"):
                 f"> Teams: {team1_mention} vs {team2_mention}\n"
                 f"> Time: {self.time.value}\n"
                 f"> Referee: \n"
-                f"> Caster: "
+                f"> Caster: \n"
+                f"> Commentator: "
             )
         else:
             content = (
