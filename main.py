@@ -3193,7 +3193,8 @@ class TimeAcceptView(discord.ui.View):
                 f"> Teams: {self.team1_name} vs {self.team2_name}\n"
                 f"> Time: {self.time}\n"
                 f"> Referee: \n"
-                f"> Caster: "
+                f"> Caster: \n"
+                f"> Commentator: "
             )
         else:
             mt_content = (
@@ -3201,7 +3202,8 @@ class TimeAcceptView(discord.ui.View):
                 f"> WEEK: {self.week}\n"
                 f"> Time: {self.time}\n"
                 f"> Referee: \n"
-                f"> Caster: "
+                f"> Caster: \n"
+                f"> Commentator: "
             )
 
         if isinstance(match_times, discord.TextChannel):
@@ -3224,7 +3226,8 @@ class TimeAcceptView(discord.ui.View):
                 f"> Teams: {self.team1_name} vs {self.team2_name}\n"
                 f"> Time: {self.time}\n"
                 f"> Referee: \n"
-                f"> Caster: "
+                f"> Caster: \n"
+                f"> Commentator: "
             )
         else:
             as_content = (
@@ -3233,7 +3236,8 @@ class TimeAcceptView(discord.ui.View):
                 f"> WEEK: {self.week}\n"
                 f"> Time: {self.time}\n"
                 f"> Referee: \n"
-                f"> Caster: "
+                f"> Caster: \n"
+                f"> Commentator: "
             )
 
         if isinstance(assignments, discord.TextChannel):
