@@ -36,7 +36,9 @@ ASSIGNMENTS_CHANNEL_ID = 1454349005202002012
 # NEW:
 REF_ASSIGNMENTS_CHANNEL_ID = 1524533755622981642       # put your #ref-assignments channel ID here
 CASTER_ASSIGNMENTS_CHANNEL_ID = 1524533429515980900    # put your #caster-assignments channel ID here
-COMMENTATOR_ASSIGNMENTS_CHANNEL_ID = 1524534102957752520  # optional separate channel, or reuse caster
+COMMENTATOR_ASSIGNMENTS_CHANNEL_ID = 1524534102957752520  # <-- your #commentator-assignments channel id
+COMMENTATOR_ROLE_ID = 1411841463175876729                # <-- your @Commentator role id
+
 
 SCRIM_CATEGORY_ID = 1410590393527046275
 SEEDING_POINTS_CHANNEL_ID = 1517019335846006784  # <- replace 0 with your seeding-points channel ID
@@ -261,6 +263,19 @@ def load_teams() -> list[dict]:
     except Exception:
         pass
     return []
+
+
+def build_staff_ping_header(guild: discord.Guild) -> str:
+    staff_mentions = []
+    for rid in (
+        HEAD_REF_ROLE_ID, REF_ROLE_ID,
+        HEAD_CASTER_ROLE_ID, CASTER_ROLE_ID,
+        COMMENTATOR_ROLE_ID,
+    ):
+        r = guild.get_role(rid)
+        if r:
+            staff_mentions.append(r.mention)
+    return " ".join(staff_mentions)
 
 
 
@@ -2934,6 +2949,7 @@ class AssignmentClaimView(discord.ui.View):
         return "final" in w or "semi" in w
 
     def _is_head_staff(self, m: discord.Member) -> bool:
+        # no head commentator role in your server
         return has_role_id(m, HEAD_REF_ROLE_ID) or has_role_id(m, HEAD_CASTER_ROLE_ID)
 
     def _is_ref_staff(self, m: discord.Member) -> bool:
@@ -2941,6 +2957,10 @@ class AssignmentClaimView(discord.ui.View):
 
     def _is_caster_staff(self, m: discord.Member) -> bool:
         return has_role_id(m, CASTER_ROLE_ID) or has_role_id(m, HEAD_CASTER_ROLE_ID)
+
+    def _is_commentator_staff(self, m: discord.Member) -> bool:
+        # IMPORTANT: you must define COMMENTATOR_ROLE_ID in your globals
+        return has_role_id(m, COMMENTATOR_ROLE_ID)
 
     def _can_override(self, new: discord.Member, old: Optional[discord.Member]) -> bool:
         """
@@ -3060,9 +3080,15 @@ class AssignmentClaimView(discord.ui.View):
             except Exception:
                 pass
 
-        # ---- ASSIGNMENTS content ----
+        # ---- ASSIGNMENTS content (PING ROLES HERE) ----
         staff_mentions = []
-        for rid in (HEAD_REF_ROLE_ID, REF_ROLE_ID, HEAD_CASTER_ROLE_ID, CASTER_ROLE_ID):
+        for rid in (
+            HEAD_REF_ROLE_ID,
+            REF_ROLE_ID,
+            HEAD_CASTER_ROLE_ID,
+            CASTER_ROLE_ID,
+            COMMENTATOR_ROLE_ID,   # <-- added
+        ):
             r = guild.get_role(rid)
             if r:
                 staff_mentions.append(r.mention)
@@ -3098,43 +3124,44 @@ class AssignmentClaimView(discord.ui.View):
                 pass
 
         # ---- Per-role assignment channels ----
+        # ALSO include buttons here so caster/commentator channels have the claim UI.
 
-        # Ref-only
         if isinstance(ref_assign_ch, discord.TextChannel):
             ref_content = (
+                f"{staff_header}\n"
                 f"{self.team1_name} vs {self.team2_name}\n"
                 f"> WEEK: {self.week}\n"
                 f"> Time: {self.time}\n"
                 f"> Referee: {ref_text}"
             )
             try:
-                await ref_assign_ch.send(ref_content)
+                await ref_assign_ch.send(ref_content, view=self)
             except Exception:
                 pass
 
-        # Caster-only
         if isinstance(caster_assign_ch, discord.TextChannel):
             caster_content = (
+                f"{staff_header}\n"
                 f"{self.team1_name} vs {self.team2_name}\n"
                 f"> WEEK: {self.week}\n"
                 f"> Time: {self.time}\n"
                 f"> Caster: {caster_text}"
             )
             try:
-                await caster_assign_ch.send(caster_content)
+                await caster_assign_ch.send(caster_content, view=self)
             except Exception:
                 pass
 
-        # Commentator-only
         if isinstance(comment_assign_ch, discord.TextChannel):
             comm_content = (
+                f"{staff_header}\n"
                 f"{self.team1_name} vs {self.team2_name}\n"
                 f"> WEEK: {self.week}\n"
                 f"> Time: {self.time}\n"
                 f"> Commentator: {comm_text}"
             )
             try:
-                await comment_assign_ch.send(comm_content)
+                await comment_assign_ch.send(comm_content, view=self)
             except Exception:
                 pass
 
@@ -3149,7 +3176,6 @@ class AssignmentClaimView(discord.ui.View):
             await interaction.response.send_message("Use this in a server.", ephemeral=True)
             return
 
-        # must be caster staff
         if not self._is_caster_staff(user):
             await interaction.response.send_message("You must be caster staff to claim Caster.", ephemeral=True)
             return
@@ -3179,7 +3205,6 @@ class AssignmentClaimView(discord.ui.View):
             await interaction.response.send_message("Use this in a server.", ephemeral=True)
             return
 
-        # must be ref staff
         if not self._is_ref_staff(user):
             await interaction.response.send_message("You must be referee staff to claim Referee.", ephemeral=True)
             return
@@ -3209,9 +3234,9 @@ class AssignmentClaimView(discord.ui.View):
             await interaction.response.send_message("Use this in a server.", ephemeral=True)
             return
 
-        # Use caster staff for commentators as well
-        if not self._is_caster_staff(user):
-            await interaction.response.send_message("You must be caster staff to claim Commentator.", ephemeral=True)
+        # commentators can claim (casters can also claim if you want)
+        if not (self._is_commentator_staff(user) or self._is_caster_staff(user)):
+            await interaction.response.send_message("You must be commentator staff to claim Commentator.", ephemeral=True)
             return
 
         # Free slot (max 2)
@@ -3221,12 +3246,11 @@ class AssignmentClaimView(discord.ui.View):
             await self._update_messages(interaction)
             return
 
-        # already commentator
         if user in self.commentators:
             await interaction.response.send_message("You are already a Commentator for this match.", ephemeral=True)
             return
 
-        # full (2 commentators) -> override rules in finals/semis only, by head staff only
+        # full (2 commentators) -> override rules in finals/semis only (head staff only)
         if not self._is_finals_or_semis():
             await interaction.response.send_message("There are already two commentators for this match.", ephemeral=True)
             return
@@ -3242,7 +3266,7 @@ class AssignmentClaimView(discord.ui.View):
                 break
 
         if overridden is None:
-            await interaction.response.send_message("There are already two head commentators for this match.", ephemeral=True)
+            await interaction.response.send_message("There are already two head staff commentators for this match.", ephemeral=True)
             return
 
         self.commentators.remove(overridden)
@@ -3307,9 +3331,8 @@ class TimeAcceptView(discord.ui.View):
             return
 
         guild = self.guild
-        match_times = guild.get_channel(MATCH_TIMES_CHANNEL_ID)
-        assignments = guild.get_channel(ASSIGNMENTS_CHANNEL_ID)
 
+        # ----- detect finals/semis formatting -----
         stage_l = (self.week or "").lower()
         if "final" in stage_l:
             header = "# FINALS"
@@ -3321,6 +3344,8 @@ class TimeAcceptView(discord.ui.View):
             header = None
             special = False
 
+        # ----- post finalized match time to MATCH_TIMES -----
+        match_times = guild.get_channel(MATCH_TIMES_CHANNEL_ID)
         if special:
             mt_content = (
                 f"{header}\n"
@@ -3346,12 +3371,8 @@ class TimeAcceptView(discord.ui.View):
             except Exception:
                 pass
 
-        staff_mentions = []
-        for rid in (HEAD_REF_ROLE_ID, REF_ROLE_ID, HEAD_CASTER_ROLE_ID, CASTER_ROLE_ID):
-            r = guild.get_role(rid)
-            if r:
-                staff_mentions.append(r.mention)
-        staff_header = " ".join(staff_mentions)
+        # ----- build assignments message WITH role pings (includes commentator role) -----
+        staff_header = build_staff_ping_header(guild)
 
         if special:
             as_content = (
@@ -3374,12 +3395,20 @@ class TimeAcceptView(discord.ui.View):
                 f"> Commentator: "
             )
 
-        if isinstance(assignments, discord.TextChannel):
-            try:
-                view = AssignmentClaimView(self.week, self.time, self.team1_name, self.team2_name)
-                await assignments.send(as_content, view=view)
-            except Exception:
-                pass
+        # ----- IMPORTANT: send the SAME view to all assignment channels so they all have buttons -----
+        view = AssignmentClaimView(self.week, self.time, self.team1_name, self.team2_name)
+
+        assignments = guild.get_channel(ASSIGNMENTS_CHANNEL_ID)
+        ref_assign_ch = guild.get_channel(REF_ASSIGNMENTS_CHANNEL_ID)
+        caster_assign_ch = guild.get_channel(CASTER_ASSIGNMENTS_CHANNEL_ID)
+        comment_assign_ch = guild.get_channel(COMMENTATOR_ASSIGNMENTS_CHANNEL_ID)
+
+        for ch in (assignments, ref_assign_ch, caster_assign_ch, comment_assign_ch):
+            if isinstance(ch, discord.TextChannel):
+                try:
+                    await ch.send(as_content, view=view)
+                except Exception:
+                    pass
 
     async def _edit_origin(self):
         if not self.origin_message:
@@ -3390,6 +3419,7 @@ class TimeAcceptView(discord.ui.View):
             t1_line += " ✅"
         if self.team2_accepted:
             t2_line += " ✅"
+
         content = (
             f"{t1_line} vs {t2_line}\n"
             f"Team staff must accept this match.\n"
@@ -3414,7 +3444,6 @@ class TimeAcceptView(discord.ui.View):
             return
 
         self.team1_accepted = True
-        # disable only Team 1 button
         for child in self.children:
             if isinstance(child, discord.ui.Button) and child.label == "Accept for Team 1":
                 child.disabled = True
@@ -3434,7 +3463,6 @@ class TimeAcceptView(discord.ui.View):
             return
 
         self.team2_accepted = True
-        # disable only Team 2 button
         for child in self.children:
             if isinstance(child, discord.ui.Button) and child.label == "Accept for Team 2":
                 child.disabled = True
@@ -3467,9 +3495,7 @@ class ForceTimeView(discord.ui.View):
         self.time_str = time_str
 
     def _build_forced_message(self) -> str:
-        # Only the "real time" line, for after /force-time is accepted
         return f"{self.team1_mention} {self.team2_mention} Your day to play is: {self.time_str}"
-
 
     def _build_staff_message(self, guild: discord.Guild) -> str:
         staff_mentions = []
@@ -3477,9 +3503,8 @@ class ForceTimeView(discord.ui.View):
             BOARD_OF_DIRECTORS_ROLE_ID,
             COMMUNITY_MANAGER_ROLE_ID,
             SUPERVISOR_ROLE_ID,
-            DEVELOPMENT_TEAM_ROLE_ID,  # <- added
+            DEVELOPMENT_TEAM_ROLE_ID,
         ):
-
             r = guild.get_role(rid)
             if r:
                 staff_mentions.append(r.mention)
@@ -3493,15 +3518,10 @@ class ForceTimeView(discord.ui.View):
         )
 
     def _find_scheduling_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
-        """
-        Try to find a scheduling channel for these two teams.
-        Uses channel name and topic; assumes '-vs-' style channels like 'team1-vs-team2'.
-        """
         t1 = self.team1_name.lower()
         t2 = self.team2_name.lower()
 
         def norm(s: str) -> str:
-            import re
             return re.sub(r"[^a-z0-9]", "", s.lower())
 
         n_t1 = norm(t1)
@@ -3529,29 +3549,22 @@ class ForceTimeView(discord.ui.View):
             await interaction.response.send_message("Only admins can accept.", ephemeral=True)
             return
 
-        # 1) Find the scheduling channel based on team names and post forced-time message
+        # 1) Find scheduling channel and post forced-time message
         sched_ch = self._find_scheduling_channel(guild)
         if not isinstance(sched_ch, discord.TextChannel):
-            await interaction.response.send_message(
-                "Could not find a scheduling channel for these teams.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("Could not find a scheduling channel for these teams.", ephemeral=True)
             return
 
-        forced_msg = self._build_forced_message()
         try:
-            await sched_ch.send(forced_msg)
+            await sched_ch.send(self._build_forced_message())
         except Exception:
             await interaction.response.send_message("Failed to send forced time message.", ephemeral=True)
             return
 
-        # 2) Auto "submit time" into MATCH_TIMES and ASSIGNMENTS
-
-        # Treat this as WEEK: Forced
+        # 2) Post MATCH_TIMES record
         week = "Forced"
         time_str = self.time_str
 
-        # MATCH_TIMES entry (like a finalized time)
         match_times = guild.get_channel(MATCH_TIMES_CHANNEL_ID)
         if isinstance(match_times, discord.TextChannel):
             mt_content = (
@@ -3559,45 +3572,46 @@ class ForceTimeView(discord.ui.View):
                 f"> WEEK: {week}\n"
                 f"> Time: {time_str}\n"
                 f"> Referee: \n"
-                f"> Caster: "
+                f"> Caster: \n"
+                f"> Commentator: "
             )
             try:
                 await match_times.send(mt_content)
             except Exception:
                 pass
 
-        # ASSIGNMENTS entry with AssignmentClaimView so staff can claim
+        # 3) Post ASSIGNMENTS + per-role assignment channels WITH BUTTONS + PINGS
+        staff_header = build_staff_ping_header(guild)
+        as_content = (
+            f"{staff_header}\n"
+            f"{self.team1_name} vs {self.team2_name}\n"
+            f"> WEEK: {week}\n"
+            f"> Time: {time_str}\n"
+            f"> Referee: \n"
+            f"> Caster: \n"
+            f"> Commentator: "
+        )
+
+        view = AssignmentClaimView(week=week, time=time_str, team1_name=self.team1_name, team2_name=self.team2_name)
+
         assignments = guild.get_channel(ASSIGNMENTS_CHANNEL_ID)
-        if isinstance(assignments, discord.TextChannel):
-            staff_mentions = []
-            for rid in (HEAD_REF_ROLE_ID, REF_ROLE_ID, HEAD_CASTER_ROLE_ID, CASTER_ROLE_ID):
-                r = guild.get_role(rid)
-                if r:
-                    staff_mentions.append(r.mention)
-            staff_header = " ".join(staff_mentions)
+        ref_assign_ch = guild.get_channel(REF_ASSIGNMENTS_CHANNEL_ID)
+        caster_assign_ch = guild.get_channel(CASTER_ASSIGNMENTS_CHANNEL_ID)
+        comment_assign_ch = guild.get_channel(COMMENTATOR_ASSIGNMENTS_CHANNEL_ID)
 
-            as_content = (
-                f"{staff_header}\n"
-                f"{self.team1_name} vs {self.team2_name}\n"
-                f"> WEEK: {week}\n"
-                f"> Time: {time_str}\n"
-                f"> Referee: \n"
-                f"> Caster: "
-            )
+        for ch in (assignments, ref_assign_ch, caster_assign_ch, comment_assign_ch):
+            if isinstance(ch, discord.TextChannel):
+                try:
+                    await ch.send(as_content, view=view)
+                except Exception:
+                    pass
 
-            try:
-                view = AssignmentClaimView(week=week, time=time_str,
-                                           team1_name=self.team1_name,
-                                           team2_name=self.team2_name)
-                await assignments.send(as_content, view=view)
-            except Exception:
-                pass
-
-        # 3) Finish up the interaction
+        # 4) Finish
         await interaction.response.send_message(
             f"Forced time posted in {sched_ch.mention} and scheduling records updated.",
             ephemeral=True,
         )
+
         for child in self.children:
             if isinstance(child, discord.ui.Button):
                 child.disabled = True
@@ -3618,10 +3632,7 @@ class ForceTimeView(discord.ui.View):
             await interaction.response.send_message("Only admins can deny.", ephemeral=True)
             return
 
-        # pick a new time
         self.time_str = generate_forced_time_string()
-
-        # update staff message with new time
         new_content = self._build_staff_message(guild)
         try:
             await interaction.message.edit(content=new_content, view=self)
