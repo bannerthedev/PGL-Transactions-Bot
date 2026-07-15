@@ -265,6 +265,7 @@ def load_teams() -> list[dict]:
     return []
 
 
+# ---------------- PING ONCE helper (ONLY ONE ping total per match) ----------------
 def ping_header_for_channel(guild: discord.Guild, channel_id: int) -> str:
     role_ids: list[int] = []
 
@@ -275,7 +276,7 @@ def ping_header_for_channel(guild: discord.Guild, channel_id: int) -> str:
     elif channel_id == COMMENTATOR_ASSIGNMENTS_CHANNEL_ID:
         role_ids = [COMMENTATOR_ROLE_ID]
     else:
-        role_ids = []  # no pings (ex: combined assignments channel)
+        role_ids = []
 
     mentions: list[str] = []
     for rid in role_ids:
@@ -284,6 +285,41 @@ def ping_header_for_channel(guild: discord.Guild, channel_id: int) -> str:
             mentions.append(r.mention)
     return " ".join(mentions)
 
+
+async def send_to_assignment_channels_ping_once(
+    *,
+    guild: discord.Guild,
+    content_builder,  # (prefix: str, channel_id: int) -> str
+    view: discord.ui.View,
+):
+    ref_ch = guild.get_channel(REF_ASSIGNMENTS_CHANNEL_ID)
+    caster_ch = guild.get_channel(CASTER_ASSIGNMENTS_CHANNEL_ID)
+    comm_ch = guild.get_channel(COMMENTATOR_ASSIGNMENTS_CHANNEL_ID)
+
+    channels = [ref_ch, caster_ch, comm_ch]  # ping priority: ref -> caster -> commentator
+    ping_used = False
+
+    for ch in channels:
+        if not isinstance(ch, discord.TextChannel):
+            continue
+
+        prefix = ""
+        if not ping_used:
+            header = ping_header_for_channel(guild, ch.id)
+            if header:
+                prefix = header + "\n"
+                ping_used = True
+
+        msg = content_builder(prefix, ch.id)
+
+        try:
+            await ch.send(
+                msg,
+                view=view,
+                allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
+            )
+        except Exception:
+            pass
 
 
 # invites.json structure:
@@ -413,6 +449,53 @@ def is_team_role(guild: discord.Guild, role: discord.Role) -> bool:
             return True
 
     return False
+
+
+
+
+
+def send_to_assignment_channels_ping_once(
+    *,
+    guild: discord.Guild,
+    content_builder,   # function(prefix:str)->str
+    view: discord.ui.View,
+):
+    async def _run():
+        ref_ch = guild.get_channel(REF_ASSIGNMENTS_CHANNEL_ID)
+        caster_ch = guild.get_channel(CASTER_ASSIGNMENTS_CHANNEL_ID)
+        comm_ch = guild.get_channel(COMMENTATOR_ASSIGNMENTS_CHANNEL_ID)
+
+        channels = [ref_ch, caster_ch, comm_ch]
+
+        ping_sent = False
+
+        for ch in channels:
+            if not isinstance(ch, discord.TextChannel):
+                continue
+
+            # ONLY the first valid channel gets the ping header
+            prefix = ""
+            if not ping_sent:
+                header_ping = ping_header_for_channel(guild, ch.id)
+                prefix = (header_ping + "\n") if header_ping else ""
+                ping_sent = bool(header_ping)  # only mark pinged if we actually pinged something
+
+            msg = content_builder(prefix)
+
+            try:
+                await ch.send(
+                    msg,
+                    view=view,
+                    allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
+                )
+            except Exception:
+                pass
+
+    return _run()
+
+
+
+
 
 def get_user_team_role(member: discord.Member) -> discord.Role | None:
     """Return the team role for this member based ONLY on teams.json, or None."""
@@ -3299,6 +3382,7 @@ class AssignmentClaimView(discord.ui.View):
 
 
 
+# ---------------- FIXED TimeAcceptView ----------------
 class TimeAcceptView(discord.ui.View):
     def __init__(
         self,
@@ -3377,22 +3461,12 @@ class TimeAcceptView(discord.ui.View):
             except Exception:
                 pass
 
-        # ---- ASSIGNMENTS: send ONLY to the 3 staff assignment channels (no CRC/all-staff spam) ----
+        # ---- ASSIGNMENT CHANNELS (PING ONCE TOTAL) ----
         view = AssignmentClaimView(self.week, self.time, self.team1_name, self.team2_name)
 
-        ref_assign_ch = guild.get_channel(REF_ASSIGNMENTS_CHANNEL_ID)
-        caster_assign_ch = guild.get_channel(CASTER_ASSIGNMENTS_CHANNEL_ID)
-        comment_assign_ch = guild.get_channel(COMMENTATOR_ASSIGNMENTS_CHANNEL_ID)
-
-        for ch in (ref_assign_ch, caster_assign_ch, comment_assign_ch):
-            if not isinstance(ch, discord.TextChannel):
-                continue
-
-            header_ping = ping_header_for_channel(guild, ch.id)
-            prefix = (header_ping + "\n") if header_ping else ""
-
+        def build_msg(prefix: str, _channel_id: int) -> str:
             if special:
-                msg = (
+                return (
                     f"{prefix}{header}\n"
                     f"> Teams: {self.team1_name} vs {self.team2_name}\n"
                     f"> Time: {self.time}\n"
@@ -3400,20 +3474,16 @@ class TimeAcceptView(discord.ui.View):
                     f"> Caster: \n"
                     f"> Commentator: "
                 )
-            else:
-                msg = (
-                    f"{prefix}{self.team1_name} vs {self.team2_name}\n"
-                    f"> WEEK: {self.week}\n"
-                    f"> Time: {self.time}\n"
-                    f"> Referee: \n"
-                    f"> Caster: \n"
-                    f"> Commentator: "
-                )
+            return (
+                f"{prefix}{self.team1_name} vs {self.team2_name}\n"
+                f"> WEEK: {self.week}\n"
+                f"> Time: {self.time}\n"
+                f"> Referee: \n"
+                f"> Caster: \n"
+                f"> Commentator: "
+            )
 
-            try:
-                await ch.send(msg, view=view)
-            except Exception:
-                pass
+        await send_to_assignment_channels_ping_once(guild=guild, content_builder=build_msg, view=view)
 
     async def _edit_origin(self):
         if not self.origin_message:
@@ -3474,6 +3544,7 @@ class TimeAcceptView(discord.ui.View):
         await self._finalize_if_ready(interaction)
 
 
+# ---------------- FIXED ForceTimeView ----------------
 class ForceTimeView(discord.ui.View):
     def __init__(
         self,
@@ -3579,21 +3650,11 @@ class ForceTimeView(discord.ui.View):
             except Exception:
                 pass
 
-        # ---- ASSIGNMENTS: send ONLY to the 3 staff assignment channels, each with its own ping ----
+        # ---- ASSIGNMENT CHANNELS (PING ONCE TOTAL) ----
         view = AssignmentClaimView(week=week, time=time_str, team1_name=self.team1_name, team2_name=self.team2_name)
 
-        ref_assign_ch = guild.get_channel(REF_ASSIGNMENTS_CHANNEL_ID)
-        caster_assign_ch = guild.get_channel(CASTER_ASSIGNMENTS_CHANNEL_ID)
-        comment_assign_ch = guild.get_channel(COMMENTATOR_ASSIGNMENTS_CHANNEL_ID)
-
-        for ch in (ref_assign_ch, caster_assign_ch, comment_assign_ch):
-            if not isinstance(ch, discord.TextChannel):
-                continue
-
-            header_ping = ping_header_for_channel(guild, ch.id)
-            prefix = (header_ping + "\n") if header_ping else ""
-
-            msg = (
+        def build_msg(prefix: str, _channel_id: int) -> str:
+            return (
                 f"{prefix}{self.team1_name} vs {self.team2_name}\n"
                 f"> WEEK: {week}\n"
                 f"> Time: {time_str}\n"
@@ -3602,10 +3663,7 @@ class ForceTimeView(discord.ui.View):
                 f"> Commentator: "
             )
 
-            try:
-                await ch.send(msg, view=view)
-            except Exception:
-                pass
+        await send_to_assignment_channels_ping_once(guild=guild, content_builder=build_msg, view=view)
 
         await interaction.response.send_message(
             f"Forced time posted in {sched_ch.mention} and scheduling records updated.",
