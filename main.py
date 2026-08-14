@@ -3148,270 +3148,142 @@ class StandingCog(commands.Cog):
 
 
 class AssignmentClaimView(discord.ui.View):
-    def __init__(self, match_id: str):
+    def __init__(
+        self,
+        week: str,
+        time: str,
+        team1_name: str,
+        team2_name: str,
+    ):
         super().__init__(timeout=None)
 
-        self.match_id = match_id
-        self._lock = asyncio.Lock()
+        self.week = week
+        self.time = time
+        self.team1_name = team1_name
+        self.team2_name = team2_name
 
-        # Referee button
-        ref_button = discord.ui.Button(
-            label="Claim Referee",
-            style=discord.ButtonStyle.primary,
-            custom_id=f"assign_claim_ref:{match_id}",
-        )
-        ref_button.callback = self._on_claim_ref
-        self.add_item(ref_button)
+        self.ref_main: Optional[int] = None
+        self.ref_backup: Optional[int] = None
+        self.caster_main: Optional[int] = None
+        self.caster_backup: Optional[int] = None
+        self.commentator_main: Optional[int] = None
+        self.commentator_backup: Optional[int] = None
 
-        # Caster button
-        caster_button = discord.ui.Button(
-            label="Claim Caster",
-            style=discord.ButtonStyle.primary,
-            custom_id=f"assign_claim_caster:{match_id}",
-        )
-        caster_button.callback = self._on_claim_caster
-        self.add_item(caster_button)
-
-        # Commentator button
-        comm_button = discord.ui.Button(
-            label="Claim Commentator",
-            style=discord.ButtonStyle.primary,
-            custom_id=f"assign_claim_comm:{match_id}",
-        )
-        comm_button.callback = self._on_claim_comm
-        self.add_item(comm_button)
-
-        # Unclaim button
-        unclaim_button = discord.ui.Button(
-            label="Unclaim",
-            style=discord.ButtonStyle.danger,
-            custom_id=f"assign_unclaim:{match_id}",
-        )
-        unclaim_button.callback = self._on_unclaim
-        self.add_item(unclaim_button)
-
-    def _get_match(self) -> Optional["MatchAssignment"]:
-        return MATCHES.get(self.match_id)
-
-    async def _refresh_message(self, interaction: discord.Interaction) -> None:
-        match = self._get_match()
-
-        if match is None:
-            return
-
-        if interaction.guild is None:
-            return
-
-        if interaction.message is None:
-            return
-
-        try:
-            await interaction.message.edit(
-                content=render_assignment_post(interaction.guild, match),
-                view=self,
+        # These custom IDs must be unique for this type of view.
+        self.add_item(
+            AssignmentClaimButton(
+                "ref_main",
+                "Claim Main Referee",
+                discord.ButtonStyle.primary,
             )
-        except discord.NotFound:
-            # The assignment message was deleted.
-            pass
-        except discord.HTTPException:
-            # Discord rejected the edit.
-            pass
+        )
+        self.add_item(
+            AssignmentClaimButton(
+                "ref_backup",
+                "Claim Backup Referee",
+                discord.ButtonStyle.secondary,
+            )
+        )
+        self.add_item(
+            AssignmentClaimButton(
+                "caster_main",
+                "Claim Main Caster",
+                discord.ButtonStyle.primary,
+            )
+        )
+        self.add_item(
+            AssignmentClaimButton(
+                "caster_backup",
+                "Claim Backup Caster",
+                discord.ButtonStyle.secondary,
+            )
+        )
+        self.add_item(
+            AssignmentClaimButton(
+                "commentator_main",
+                "Claim Main Commentator",
+                discord.ButtonStyle.primary,
+            )
+        )
+        self.add_item(
+            AssignmentClaimButton(
+                "commentator_backup",
+                "Claim Backup Commentator",
+                discord.ButtonStyle.secondary,
+            )
+        )
 
-    def _user_has_claim(self, match: "MatchAssignment", user_id: int) -> bool:
-        return match.user_has_any_claim(user_id)
-
-    def _claim_referee(
-        self,
-        match: "MatchAssignment",
-        user_id: int,
-    ) -> bool:
-        if match.ref_main is None:
-            match.ref_main = user_id
-            return True
-
-        if match.ref_backup is None:
-            match.ref_backup = user_id
-            return True
-
-        return False
-
-    def _claim_caster(
-        self,
-        match: "MatchAssignment",
-        user_id: int,
-    ) -> bool:
-        if match.caster_main is None:
-            match.caster_main = user_id
-            return True
-
-        if match.caster_backup is None:
-            match.caster_backup = user_id
-            return True
-
-        return False
-
-    def _claim_commentator(
-        self,
-        match: "MatchAssignment",
-        user_id: int,
-    ) -> bool:
-        if user_id in match.comm_main or user_id in match.comm_backup:
-            return False
-
-        if len(match.comm_main) < NUM_MAIN_COMMENTATORS:
-            match.comm_main.append(user_id)
-            return True
-
-        if len(match.comm_backup) < NUM_BACKUP_COMMENTATORS:
-            match.comm_backup.append(user_id)
-            return True
-
-        return False
-
-    def _unclaim(
-        self,
-        match: "MatchAssignment",
-        user_id: int,
-    ) -> bool:
-        changed = False
-
-        if match.ref_main == user_id:
-            match.ref_main = None
-            changed = True
-
-        if match.ref_backup == user_id:
-            match.ref_backup = None
-            changed = True
-
-        if match.caster_main == user_id:
-            match.caster_main = None
-            changed = True
-
-        if match.caster_backup == user_id:
-            match.caster_backup = None
-            changed = True
-
-        if user_id in match.comm_main:
-            match.comm_main.remove(user_id)
-            changed = True
-
-        if user_id in match.comm_backup:
-            match.comm_backup.remove(user_id)
-            changed = True
-
-        return changed
-
-    async def _claim(
+    async def claim_role(
         self,
         interaction: discord.Interaction,
-        claim_function,
-        success_message: str,
-        full_message: str,
-    ) -> None:
-        # Acknowledge the button interaction immediately.
-        await interaction.response.defer(ephemeral=True)
-
+        role_name: str,
+    ):
         user_id = interaction.user.id
 
-        async with self._lock:
-            match = self._get_match()
+        # Prevent the same person from claiming multiple positions.
+        current_claims = {
+            self.ref_main,
+            self.ref_backup,
+            self.caster_main,
+            self.caster_backup,
+            self.commentator_main,
+            self.commentator_backup,
+        }
 
-            if match is None:
-                await interaction.followup.send(
-                    "This match is no longer available.",
-                    ephemeral=True,
-                )
-                return
+        if user_id in current_claims:
+            await interaction.response.send_message(
+                "You already claimed a position for this match.",
+                ephemeral=True,
+            )
+            return
 
-            if self._user_has_claim(match, user_id):
-                await interaction.followup.send(
-                    "You cannot claim more than one assignment.",
-                    ephemeral=True,
-                )
-                return
+        if getattr(self, role_name) is not None:
+            await interaction.response.send_message(
+                "That position has already been claimed.",
+                ephemeral=True,
+            )
+            return
 
-            claimed = claim_function(match, user_id)
+        setattr(self, role_name, user_id)
 
-            if not claimed:
-                await interaction.followup.send(
-                    full_message,
-                    ephemeral=True,
-                )
-                return
-
-            await self._refresh_message(interaction)
-
-        await interaction.followup.send(
-            success_message,
+        await interaction.response.send_message(
+            f"You claimed **{role_name.replace('_', ' ').title()}**.",
             ephemeral=True,
         )
 
-    async def _on_claim_ref(
+        if interaction.message:
+            await interaction.message.edit(view=self)
+
+
+
+class AssignmentClaimButton(discord.ui.Button):
+    def __init__(
         self,
-        interaction: discord.Interaction,
-    ) -> None:
-        await self._claim(
-            interaction=interaction,
-            claim_function=self._claim_referee,
-            success_message="You claimed the referee assignment.",
-            full_message="Both referee slots are already full.",
+        role_name: str,
+        label: str,
+        style: discord.ButtonStyle,
+    ):
+        self.role_name = role_name
+
+        super().__init__(
+            label=label,
+            style=style,
+            custom_id=f"assignment_claim:{role_name}",
         )
 
-    async def _on_claim_caster(
-        self,
-        interaction: discord.Interaction,
-    ) -> None:
-        await self._claim(
-            interaction=interaction,
-            claim_function=self._claim_caster,
-            success_message="You claimed the caster assignment.",
-            full_message="Both caster slots are already full.",
+    async def callback(self, interaction: discord.Interaction):
+        if not isinstance(self.view, AssignmentClaimView):
+            await interaction.response.send_message(
+                "This assignment view is no longer available.",
+                ephemeral=True,
+            )
+            return
+
+        await self.view.claim_role(
+            interaction,
+            self.role_name,
         )
 
-    async def _on_claim_comm(
-        self,
-        interaction: discord.Interaction,
-    ) -> None:
-        await self._claim(
-            interaction=interaction,
-            claim_function=self._claim_commentator,
-            success_message="You claimed the commentator assignment.",
-            full_message="All commentator slots are already full.",
-        )
-
-    async def _on_unclaim(
-        self,
-        interaction: discord.Interaction,
-    ) -> None:
-        await interaction.response.defer(ephemeral=True)
-
-        user_id = interaction.user.id
-
-        async with self._lock:
-            match = self._get_match()
-
-            if match is None:
-                await interaction.followup.send(
-                    "This match is no longer available.",
-                    ephemeral=True,
-                )
-                return
-
-            removed = self._unclaim(match, user_id)
-
-            if not removed:
-                await interaction.followup.send(
-                    "You do not have an assignment claimed here.",
-                    ephemeral=True,
-                )
-                return
-
-            await self._refresh_message(interaction)
-
-        await interaction.followup.send(
-            "You successfully unclaimed your assignment.",
-            ephemeral=True,
-        )
 
 
 MAIN_ALERT_TEXT = (
@@ -3622,162 +3494,143 @@ class ScrimAlertLoop(commands.Cog):
 class TimeAcceptView(discord.ui.View):
     def __init__(
         self,
-        guild: discord.Guild,
-        team1_role: Optional[discord.Role],
-        team2_role: Optional[discord.Role],
-        team1_name: str,
-        team2_name: str,
         week: str,
         time: str,
+        team1_name: str,
+        team2_name: str,
+        starts_at_utc=None,
+        *,
+        timeout: Optional[float] = None,
     ):
-        super().__init__(timeout=None)
-        self.guild = guild
-        self.team1_role = team1_role
-        self.team2_role = team2_role
-        self.team1_name = team1_name
-        self.team2_name = team2_name
+        super().__init__(timeout=timeout)
+
         self.week = week
         self.time = time
+        self.team1_name = team1_name
+        self.team2_name = team2_name
+        self.starts_at_utc = starts_at_utc
 
-        self.team1_accepted: bool = False
-        self.team2_accepted: bool = False
-        self.origin_message: Optional[discord.Message] = None
+        self.team1_accepted = False
+        self.team2_accepted = False
+        self.finalized = False
 
-        self.team1_mention = team1_role.mention if isinstance(team1_role, discord.Role) else team1_name
-        self.team2_mention = team2_role.mention if isinstance(team2_role, discord.Role) else team2_name
+        self.team1_user_id: Optional[int] = None
+        self.team2_user_id: Optional[int] = None
 
-    def _is_team_lead(self, member: discord.Member, team_role: Optional[discord.Role]) -> bool:
-        if team_role is None:
-            return False
-        if team_role not in member.roles:
-            return False
-        return any(has_role_id(member, rid) for rid in (CAPTAIN_ROLE_ID, CO_CAPTAIN_ROLE_ID, TEAM_EXEC_ROLE_ID))
-
-    async def _finalize_if_ready(self, interaction: discord.Interaction):
-        if not (self.team1_accepted and self.team2_accepted):
-            return
-
-        guild = self.guild
-
-        stage_l = (self.week or "").lower()
-        if "final" in stage_l:
-            header = "# FINALS"
-            special = True
-        elif "semi" in stage_l:
-            header = "# SEMIFINALS"
-            special = True
-        else:
-            header = None
-            special = False
-
-        # ---- MATCH_TIMES ----
-        match_times = guild.get_channel(MATCH_TIMES_CHANNEL_ID)
-        if special:
-            mt_content = (
-                f"{header}\n"
-                f"> Teams: {self.team1_name} vs {self.team2_name}\n"
-                f"> Time: {self.time}\n"
-                f"> Referee: \n"
-                f"> Caster: \n"
-                f"> Commentator: "
-            )
-        else:
-            mt_content = (
-                f"{self.team1_name} vs {self.team2_name}\n"
-                f"> WEEK: {self.week}\n"
-                f"> Time: {self.time}\n"
-                f"> Referee: \n"
-                f"> Caster: \n"
-                f"> Commentator: "
-            )
-
-        if isinstance(match_times, discord.TextChannel):
-            try:
-                await match_times.send(mt_content)
-            except Exception:
-                pass
-
-        # ---- ASSIGNMENT CHANNELS (PING ONCE TOTAL) ----
-        view = AssignmentClaimView(self.week, self.time, self.team1_name, self.team2_name)
-
-        def build_msg(prefix: str, _channel_id: int) -> str:
-            if special:
-                return (
-                    f"{prefix}{header}\n"
-                    f"> Teams: {self.team1_name} vs {self.team2_name}\n"
-                    f"> Time: {self.time}\n"
-                    f"> Referee: \n"
-                    f"> Caster: \n"
-                    f"> Commentator: "
-                )
-            return (
-                f"{prefix}{self.team1_name} vs {self.team2_name}\n"
-                f"> WEEK: {self.week}\n"
-                f"> Time: {self.time}\n"
-                f"> Referee: \n"
-                f"> Caster: \n"
-                f"> Commentator: "
-            )
-
-        await send_to_assignment_channels_ping_once(guild=guild, content_builder=build_msg, view=view)
-
-    async def _edit_origin(self):
-        if not self.origin_message:
-            return
-
-        t1_line = f"{self.team1_mention}" + (" ✅" if self.team1_accepted else "")
-        t2_line = f"{self.team2_mention}" + (" ✅" if self.team2_accepted else "")
-
-        content = (
-            f"{t1_line} vs {t2_line}\n"
-            f"Team staff must accept this match.\n"
-            f"> WEEK: {self.week}\n"
-            f"> Time: {self.time}\n"
-            f"> Team 1: {'Accepted ✅' if self.team1_accepted else ''}\n"
-            f"> Team 2: {'Accepted ✅' if self.team2_accepted else ''}\n"
+        self.team1_button = discord.ui.Button(
+            label=f"Accept for {team1_name}",
+            style=discord.ButtonStyle.success,
+            custom_id=f"time_accept:team1:{week}:{time}",
         )
-        try:
-            await self.origin_message.edit(content=content, view=self)
-        except Exception:
-            pass
 
-    @discord.ui.button(label="Accept for Team 1", style=discord.ButtonStyle.success)
-    async def accept_team1(self, interaction: discord.Interaction, button: discord.ui.Button):
-        member = interaction.user
-        if not self._is_team_lead(member, self.team1_role):
-            await interaction.response.send_message("Only staff from Team 1 (captain/co-cap/exec) can accept.", ephemeral=True)
+        self.team2_button = discord.ui.Button(
+            label=f"Accept for {team2_name}",
+            style=discord.ButtonStyle.success,
+            custom_id=f"time_accept:team2:{week}:{time}",
+        )
+
+        self.team1_button.callback = self.accept_team1
+        self.team2_button.callback = self.accept_team2
+
+        self.add_item(self.team1_button)
+        self.add_item(self.team2_button)
+
+    async def accept_team1(self, interaction: discord.Interaction):
+        if self.finalized:
+            await interaction.response.send_message(
+                "This match has already been finalized.",
+                ephemeral=True,
+            )
             return
+
         if self.team1_accepted:
-            await interaction.response.send_message("Team 1 already accepted.", ephemeral=True)
+            await interaction.response.send_message(
+                f"{self.team1_name} has already accepted.",
+                ephemeral=True,
+            )
             return
 
         self.team1_accepted = True
-        for child in self.children:
-            if isinstance(child, discord.ui.Button) and child.label == "Accept for Team 1":
-                child.disabled = True
+        self.team1_user_id = interaction.user.id
+        self.team1_button.disabled = True
 
-        await self._edit_origin()
-        await interaction.response.send_message("Team 1 accepted.", ephemeral=True)
+        await interaction.response.edit_message(view=self)
+
         await self._finalize_if_ready(interaction)
 
-    @discord.ui.button(label="Accept for Team 2", style=discord.ButtonStyle.success)
-    async def accept_team2(self, interaction: discord.Interaction, button: discord.ui.Button):
-        member = interaction.user
-        if not self._is_team_lead(member, self.team2_role):
-            await interaction.response.send_message("Only staff from Team 2 (captain/co-cap/exec) can accept.", ephemeral=True)
+    async def accept_team2(self, interaction: discord.Interaction):
+        if self.finalized:
+            await interaction.response.send_message(
+                "This match has already been finalized.",
+                ephemeral=True,
+            )
             return
+
         if self.team2_accepted:
-            await interaction.response.send_message("Team 2 already accepted.", ephemeral=True)
+            await interaction.response.send_message(
+                f"{self.team2_name} has already accepted.",
+                ephemeral=True,
+            )
             return
 
         self.team2_accepted = True
-        for child in self.children:
-            if isinstance(child, discord.ui.Button) and child.label == "Accept for Team 2":
-                child.disabled = True
+        self.team2_user_id = interaction.user.id
+        self.team2_button.disabled = True
 
-        await self._edit_origin()
-        await interaction.response.send_message("Team 2 accepted.", ephemeral=True)
+        await interaction.response.edit_message(view=self)
+
         await self._finalize_if_ready(interaction)
+
+    async def _finalize_if_ready(
+        self,
+        interaction: discord.Interaction,
+    ):
+        if not self.team1_accepted or not self.team2_accepted:
+            return
+
+        if self.finalized:
+            return
+
+        self.finalized = True
+
+        # Disable both buttons permanently.
+        self.team1_button.disabled = True
+        self.team2_button.disabled = True
+
+        if interaction.message:
+            await interaction.message.edit(view=self)
+
+        # Create the assignment post.
+        assignment_view = AssignmentClaimView(
+            self.week,
+            self.time,
+            self.team1_name,
+            self.team2_name,
+        )
+
+        assignment_text = (
+            f"## Staff Assignments\n"
+            f"**Week:** {self.week}\n"
+            f"**Time:** {self.time}\n"
+            f"**Match:** {self.team1_name} vs {self.team2_name}\n\n"
+            f"Claim a position using the buttons below."
+        )
+
+        # Use the same assignments channel constant already in your bot.
+        assignments_channel = interaction.guild.get_channel(
+            ASSIGNMENTS_CHANNEL_ID
+        ) if interaction.guild else None
+
+        if not isinstance(assignments_channel, discord.TextChannel):
+            print(
+                "ERROR: ASSIGNMENTS_CHANNEL_ID does not point to a text channel."
+            )
+            return
+
+        await assignments_channel.send(
+            assignment_text,
+            view=assignment_view,
+        )
 
 
 # ---------------- UPDATED ForceTimeView ----------------
