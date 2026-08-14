@@ -10,7 +10,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from typing import Optional, List
-import RoleType
 import uuid
 import aiohttp
 import discord
