@@ -1,23 +1,29 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import os
-import re
-from urllib.parse import urlparse, parse_qs
 import random
-from PIL import Image, ImageDraw, ImageFont
-from datetime import datetime, timedelta
-from typing import Optional
-import aiohttp
+import re
 import xml.etree.ElementTree as ET
-import dotenv
-
-import discord
-from discord.ext import commands
-from discord import app_commands, Object
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from discord.ext import tasks
+from urllib.parse import parse_qs, urlparse
+from typing import Optional, List
+import RoleType
+import uuid
+import aiohttp
+import discord
 from aiohttp import web
+from discord import Object, app_commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
+from PIL import Image, ImageDraw, ImageFont
+from typing import Optional  # add List only if you truly still use List[...]
+MATCHES: dict[str, MatchAssignment] = {}
+MATCHES: dict[str, "MatchAssignment"] = {}
+
+from .assignments_state import MATCHES, MatchAssignment, RoleType
 
 load_dotenv()
 
@@ -31,13 +37,17 @@ TRANSACTIONS_CHANNEL_ID = 1416462357718241410
 TRANSACTIONS_HELP_CHANNEL_ID = 1426624895722197193
 MATCH_SCORE_CHANNEL_ID = 1409043896989777982
 MATCH_TIMES_CHANNEL_ID = 1409044495743582268
-ASSIGNMENTS_CHANNEL_ID = 1454349005202002012
 
 # NEW:
-REF_ASSIGNMENTS_CHANNEL_ID = 1524533755622981642       # put your #ref-assignments channel ID here
-CASTER_ASSIGNMENTS_CHANNEL_ID = 1524533429515980900    # put your #caster-assignments channel ID here
-COMMENTATOR_ASSIGNMENTS_CHANNEL_ID = 1524534102957752520  # <-- your #commentator-assignments channel id
 COMMENTATOR_ROLE_ID = 1411841463175876729                # <-- your @Commentator role id
+
+ASSIGNMENTS_CHANNEL_ID = 1454349005202002012  # set yours
+
+NUM_MAIN_COMMENTATORS = 2
+NUM_BACKUP_COMMENTATORS = 2
+
+# optional: where to log denies/needs replacement (can be same as assignments)
+ALERT_LOG_CHANNEL_ID = ASSIGNMENTS_CHANNEL_ID
 
 
 SCRIM_CATEGORY_ID = 1410590393527046275
@@ -115,6 +125,7 @@ ROSTER_LOCK_FILE = data_dir / "roster_lock.json"
 CONFIG_FILE = data_dir / "config.json"
 CODES_STATE_FILE = data_dir / "codes_state.json"
 HEADSETS_FILE = data_dir / "headsets.json"
+SEEDING_STATE_FILE = data_dir / "seeding_state.json"
 
 
 
@@ -151,6 +162,13 @@ BRACKET_SLOT_COORDS = {
 }
 
 
+from enum import StrEnum  # Python 3.11+
+# for 3.10, use: from enum import Enum and subclass str, Enum
+
+class RoleType(StrEnum):
+    REF = "ref"
+    CASTER = "caster"
+    COMMENTATOR = "commentator"
 
 
 def format_list_arrow(items: list[str]) -> str:
@@ -158,7 +176,32 @@ def format_list_arrow(items: list[str]) -> str:
         return "> • None"
     return "\n".join(f"> • {it}" for it in items)
 
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional
 
+
+@dataclass
+class MatchAssignment:
+    match_id: str
+    guild_id: int
+    team1_name: str
+    team2_name: str
+    week: str
+    time_str: str
+    starts_at_utc: datetime
+    assignments_channel_id: int
+    assignments_message_id: int
+
+    ref_main: Optional[int] = None
+    ref_backup: Optional[int] = None
+    caster_main: Optional[int] = None
+    caster_backup: Optional[int] = None
+    comm_main: Optional[int] = None
+    comm_backup: Optional[int] = None
+
+    alerted_main: bool = False
+    alerted_backup: bool = False
 
 
 
@@ -265,61 +308,132 @@ def load_teams() -> list[dict]:
     return []
 
 
-# ---------------- PING ONCE helper (ONLY ONE ping total per match) ----------------
-def ping_header_for_channel(guild: discord.Guild, channel_id: int) -> str:
-    role_ids: list[int] = []
+def generate_forced_time() -> tuple[str, datetime]:
+    """
+    Returns: (time_str, starts_at_utc) where starts_at_utc is tz-aware UTC.
+    Adjust the logic to your league rules.
+    """
+    now = datetime.now(timezone.utc)
 
-    if channel_id == REF_ASSIGNMENTS_CHANNEL_ID:
-        role_ids = [HEAD_REF_ROLE_ID, REF_ROLE_ID]
-    elif channel_id == CASTER_ASSIGNMENTS_CHANNEL_ID:
-        role_ids = [HEAD_CASTER_ROLE_ID, CASTER_ROLE_ID]
-    elif channel_id == COMMENTATOR_ASSIGNMENTS_CHANNEL_ID:
-        role_ids = [COMMENTATOR_ROLE_ID]
-    else:
-        role_ids = []
+    # Pick 1–5 days from now
+    days_ahead = random.randint(1, 5)
+    day = (now + timedelta(days=days_ahead)).date()
+
+    # Pick an hour slot (UTC)
+    hour = random.choice([18, 19, 20, 21, 22])  # adjust
+    minute = random.choice([0, 30])
+
+    starts_at_utc = datetime(
+        year=day.year,
+        month=day.month,
+        day=day.day,
+        hour=hour,
+        minute=minute,
+        tzinfo=timezone.utc,
+    )
+
+    time_str = starts_at_utc.strftime("%a %b %d, %H:%M UTC")
+    return time_str, starts_at_utc
+
+
+async def post_single_assignment_message(
+    bot: commands.Bot,
+    guild: discord.Guild,
+    *,
+    team1_name: str,
+    team2_name: str,
+    week: str,
+    time_str: str,
+    starts_at_utc: datetime,
+) -> MatchAssignment:
+    channel = guild.get_channel(ASSIGNMENTS_CHANNEL_ID)
+
+    if channel is None:
+        channel = await bot.fetch_channel(ASSIGNMENTS_CHANNEL_ID)
+
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        raise RuntimeError(
+            "ASSIGNMENTS_CHANNEL_ID is not a text channel or thread."
+        )
+
+    if starts_at_utc.tzinfo is None:
+        raise ValueError("starts_at_utc must be timezone-aware.")
+
+    starts_at_utc = starts_at_utc.astimezone(timezone.utc)
+
+    match_id = uuid.uuid4().hex[:10]
+
+    assignment = MatchAssignment(
+        match_id=match_id,
+        guild_id=guild.id,
+        team1_name=team1_name,
+        team2_name=team2_name,
+        week=week,
+        time_str=time_str,
+        starts_at_utc=starts_at_utc,
+        assignments_channel_id=channel.id,
+        assignments_message_id=0,
+    )
+
+    MATCHES[match_id] = assignment
+
+    view = AssignmentClaimView(match_id=match_id)
+    content = render_assignment_post(assignment)
+
+    try:
+        message = await channel.send(content=content, view=view)
+    except Exception:
+        MATCHES.pop(match_id, None)
+        raise
+
+    assignment.assignments_message_id = message.id
+    return assignment
+
+
+# ---------------- PING helper (single assignments channel) ----------------
+
+def build_assignments_ping_header(guild: discord.Guild) -> str:
+    """
+    Return the role mentions you want to ping for a new assignment post.
+    Ping once (only when posting the message).
+    """
+    role_ids: list[int] = [
+        HEAD_REF_ROLE_ID, REF_ROLE_ID,
+        HEAD_CASTER_ROLE_ID, CASTER_ROLE_ID,
+        COMMENTATOR_ROLE_ID,
+    ]
 
     mentions: list[str] = []
     for rid in role_ids:
         r = guild.get_role(rid)
         if r:
             mentions.append(r.mention)
+
     return " ".join(mentions)
 
 
-async def send_to_assignment_channels_ping_once(
+async def send_to_assignments_channel_ping_once(
     *,
     guild: discord.Guild,
-    content_builder,  # (prefix: str, channel_id: int) -> str
+    content: str,
     view: discord.ui.View,
+    ping: bool = True,
 ):
-    ref_ch = guild.get_channel(REF_ASSIGNMENTS_CHANNEL_ID)
-    caster_ch = guild.get_channel(CASTER_ASSIGNMENTS_CHANNEL_ID)
-    comm_ch = guild.get_channel(COMMENTATOR_ASSIGNMENTS_CHANNEL_ID)
+    ch = guild.get_channel(ASSIGNMENTS_CHANNEL_ID)
+    if not isinstance(ch, discord.TextChannel):
+        return None
 
-    channels = [ref_ch, caster_ch, comm_ch]  # ping priority: ref -> caster -> commentator
-    ping_used = False
+    prefix = ""
+    if ping:
+        header = build_assignments_ping_header(guild)
+        if header:
+            prefix = header + "\n"
 
-    for ch in channels:
-        if not isinstance(ch, discord.TextChannel):
-            continue
-
-        prefix = ""
-        if not ping_used:
-            header = ping_header_for_channel(guild, ch.id)
-            if header:
-                prefix = header + "\n"
-                ping_used = True
-
-        msg = content_builder(prefix, ch.id)
-
-        try:
-            await ch.send(
-                msg,
-                view=view,
-                allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
-            )
-        except Exception:
-            pass
+    return await ch.send(
+        prefix + content,
+        view=view,
+        allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
+    )
 
 
 # invites.json structure:
@@ -451,50 +565,70 @@ def is_team_role(guild: discord.Guild, role: discord.Role) -> bool:
     return False
 
 
+def mention_or_blank(guild: discord.Guild, user_id: Optional[int]) -> str:
+    if not user_id:
+        return ""
+    return f"<@{user_id}>"
 
+def mention_list(user_ids: List[int]) -> str:
+    return ", ".join(f"<@{uid}>" for uid in user_ids)
 
+def render_assignment_post(guild: discord.Guild, m: MatchAssignment) -> str:
+    # Format exactly like your example (with main + backup)
+    ref_line = ""
+    if m.ref_main:
+        ref_line += mention_or_blank(guild, m.ref_main)
+    if m.ref_backup:
+        ref_line += f" (back up) {mention_or_blank(guild, m.ref_backup)}"
 
-def send_to_assignment_channels_ping_once(
-    *,
-    guild: discord.Guild,
-    content_builder,   # function(prefix:str)->str
-    view: discord.ui.View,
-):
-    async def _run():
-        ref_ch = guild.get_channel(REF_ASSIGNMENTS_CHANNEL_ID)
-        caster_ch = guild.get_channel(CASTER_ASSIGNMENTS_CHANNEL_ID)
-        comm_ch = guild.get_channel(COMMENTATOR_ASSIGNMENTS_CHANNEL_ID)
+    caster_line = ""
+    if m.caster_main:
+        caster_line += mention_or_blank(guild, m.caster_main)
+    if m.caster_backup:
+        caster_line += f" (back up) {mention_or_blank(guild, m.caster_backup)}"
 
-        channels = [ref_ch, caster_ch, comm_ch]
+    comm_line_parts = []
+    if m.comm_main:
+        comm_line_parts.append(mention_list(m.comm_main))
+    if m.comm_backup:
+        comm_line_parts.append(f"(back up) {mention_list(m.comm_backup)}")
+    comm_line = " ".join(comm_line_parts)
 
-        ping_sent = False
+    return (
+        f"{m.team1_name} vs {m.team2_name}\n"
+        f"> WEEK: {m.week}\n"
+        f"> Time: {m.time_str}\n"
+        f"> Referee: {ref_line}\n"
+        f"> Caster: {caster_line}\n"
+        f"> Commentators: {comm_line}\n"
+    )
 
-        for ch in channels:
-            if not isinstance(ch, discord.TextChannel):
-                continue
+async def send_to_assignment_channels_ping_once(
+    bot: commands.Bot,
+    m: MatchAssignment,
+    content_without_ping: str,
+    ping_text: str,
+) -> None:
+    """
+    Edits the existing assignment message.
+    If not pinged before, prepends ping_text once.
+    """
+    channel = bot.get_channel(m.assignments_channel_id)
+    if channel is None:
+        channel = await bot.fetch_channel(m.assignments_channel_id)
 
-            # ONLY the first valid channel gets the ping header
-            prefix = ""
-            if not ping_sent:
-                header_ping = ping_header_for_channel(guild, ch.id)
-                prefix = (header_ping + "\n") if header_ping else ""
-                ping_sent = bool(header_ping)  # only mark pinged if we actually pinged something
+    msg = await channel.fetch_message(m.assignments_message_id)
 
-            msg = content_builder(prefix)
+    if not m.pinged_once and ping_text:
+        await msg.edit(content=f"{ping_text}\n{content_without_ping}")
+        m.pinged_once = True
+    else:
+        await msg.edit(content=content_without_ping)
 
-            try:
-                await ch.send(
-                    msg,
-                    view=view,
-                    allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
-                )
-            except Exception:
-                pass
-
-    return _run()
-
-
-
+def build_staff_ping_header(staff_role_id: Optional[int] = None) -> str:
+    if staff_role_id:
+        return f"<@&{staff_role_id}>"
+    return "@here"  # or "" if you don't want any ping
 
 
 def get_user_team_role(member: discord.Member) -> discord.Role | None:
@@ -3016,368 +3150,473 @@ class StandingCog(commands.Cog):
         await interaction.followup.send(content, ephemeral=True)
 
 
-
-
-
 class AssignmentClaimView(discord.ui.View):
-    def __init__(self, week: str, time: str, team1_name: str, team2_name: str):
+    def __init__(self, match_id: str):
         super().__init__(timeout=None)
-        self.week = week
-        self.time = time
-        self.team1_name = team1_name
-        self.team2_name = team2_name
 
-        self.caster: Optional[discord.Member] = None
-        self.referee: Optional[discord.Member] = None
-        # Up to 2 commentators
-        self.commentators: list[discord.Member] = []
+        self.match_id = match_id
+        self._lock = asyncio.Lock()
 
-    # ---------- helpers ----------
+        # Referee button
+        ref_button = discord.ui.Button(
+            label="Claim Referee",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"assign_claim_ref:{match_id}",
+        )
+        ref_button.callback = self._on_claim_ref
+        self.add_item(ref_button)
 
-    def _is_finals_or_semis(self) -> bool:
-        w = (self.week or "").lower()
-        return "final" in w or "semi" in w
+        # Caster button
+        caster_button = discord.ui.Button(
+            label="Claim Caster",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"assign_claim_caster:{match_id}",
+        )
+        caster_button.callback = self._on_claim_caster
+        self.add_item(caster_button)
 
-    def _is_head_staff(self, m: discord.Member) -> bool:
-        # no head commentator role in your server
-        return has_role_id(m, HEAD_REF_ROLE_ID) or has_role_id(m, HEAD_CASTER_ROLE_ID)
+        # Commentator button
+        comm_button = discord.ui.Button(
+            label="Claim Commentator",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"assign_claim_comm:{match_id}",
+        )
+        comm_button.callback = self._on_claim_comm
+        self.add_item(comm_button)
 
-    def _is_ref_staff(self, m: discord.Member) -> bool:
-        return has_role_id(m, REF_ROLE_ID) or has_role_id(m, HEAD_REF_ROLE_ID)
+        # Unclaim button
+        unclaim_button = discord.ui.Button(
+            label="Unclaim",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"assign_unclaim:{match_id}",
+        )
+        unclaim_button.callback = self._on_unclaim
+        self.add_item(unclaim_button)
 
-    def _is_caster_staff(self, m: discord.Member) -> bool:
-        return has_role_id(m, CASTER_ROLE_ID) or has_role_id(m, HEAD_CASTER_ROLE_ID)
+    def _get_match(self) -> Optional["MatchAssignment"]:
+        return MATCHES.get(self.match_id)
 
-    def _is_commentator_staff(self, m: discord.Member) -> bool:
-        # IMPORTANT: you must define COMMENTATOR_ROLE_ID in your globals
-        return has_role_id(m, COMMENTATOR_ROLE_ID)
+    async def _refresh_message(self, interaction: discord.Interaction) -> None:
+        match = self._get_match()
 
-    def _can_override(self, new: discord.Member, old: Optional[discord.Member]) -> bool:
-        """
-        Override rules (only used in Semis/Finals):
-        - If there is no old: always ok.
-        - If new is head staff and old is NOT head staff: allowed (override).
-        - If old is head staff and new is not: not allowed.
-        - If both head staff and different members: not allowed.
-        - If same member: allowed (no change).
-        """
-        if old is None:
-            return True
-        if new.id == old.id:
-            return True
+        if match is None:
+            return
 
-        new_is_head = self._is_head_staff(new)
-        old_is_head = self._is_head_staff(old)
+        if interaction.guild is None:
+            return
 
-        if not self._is_finals_or_semis():
-            # Outside Finals/Semis we do not allow overrides; first claim wins
-            return False
-
-        if new_is_head and not old_is_head:
-            return True
-        if old_is_head and not new_is_head:
-            return False
-        if new_is_head and old_is_head:
-            return False  # head vs head -> no override
-
-        # both normal staff, finals/semis -> no override
-        return False
-
-    async def _find_message_to_edit(self, channel: discord.TextChannel) -> Optional[discord.Message]:
-        if channel is None:
-            return None
-
-        stage_l = (self.week or "").lower()
-        if "final" in stage_l:
-            header = "# FINALS"
-            special = True
-        elif "semi" in stage_l:
-            header = "# SEMIFINALS"
-            special = True
-        else:
-            header = ""
-            special = False
-
-        teams_line_regular = f"{self.team1_name} vs {self.team2_name}"
-        teams_line_special = f"> Teams: {self.team1_name} vs {self.team2_name}"
-        q_week = f"> WEEK: {self.week}"
-        q_time = f"> Time: {self.time}"
+        if interaction.message is None:
+            return
 
         try:
-            async for msg in channel.history(limit=200):
-                c = msg.content or ""
-                if special:
-                    if header in c and teams_line_special in c:
-                        return msg
-                else:
-                    if teams_line_regular in c and q_week in c and q_time in c:
-                        return msg
-        except Exception:
-            return None
-        return None
-
-    async def _update_messages(self, interaction: discord.Interaction):
-        guild = interaction.guild
-        if guild is None:
-            return
-
-        match_times = guild.get_channel(MATCH_TIMES_CHANNEL_ID)
-        assignments = guild.get_channel(ASSIGNMENTS_CHANNEL_ID)
-        ref_assign_ch = guild.get_channel(REF_ASSIGNMENTS_CHANNEL_ID)
-        caster_assign_ch = guild.get_channel(CASTER_ASSIGNMENTS_CHANNEL_ID)
-        comment_assign_ch = guild.get_channel(COMMENTATOR_ASSIGNMENTS_CHANNEL_ID)
-
-        caster_text = self.caster.mention if self.caster else ""
-        ref_text = self.referee.mention if self.referee else ""
-        comm_text = " ".join(m.mention for m in self.commentators) if self.commentators else ""
-
-        stage_l = (self.week or "").lower()
-        if "final" in stage_l:
-            header = "# FINALS"
-            special = True
-        elif "semi" in stage_l:
-            header = "# SEMIFINALS"
-            special = True
-        else:
-            header = None
-            special = False
-
-        # ---- MATCH_TIMES content ----
-        if special:
-            mt_content = (
-                f"{header}\n"
-                f"> Teams: {self.team1_name} vs {self.team2_name}\n"
-                f"> Time: {self.time}\n"
-                f"> Referee: {ref_text}\n"
-                f"> Caster: {caster_text}\n"
-                f"> Commentator: {comm_text}"
+            await interaction.message.edit(
+                content=render_assignment_post(interaction.guild, match),
+                view=self,
             )
-        else:
-            mt_content = (
-                f"{self.team1_name} vs {self.team2_name}\n"
-                f"> WEEK: {self.week}\n"
-                f"> Time: {self.time}\n"
-                f"> Referee: {ref_text}\n"
-                f"> Caster: {caster_text}\n"
-                f"> Commentator: {comm_text}"
-            )
-
-        if isinstance(match_times, discord.TextChannel):
-            mt_msg = await self._find_message_to_edit(match_times)
-            try:
-                if mt_msg:
-                    await mt_msg.edit(content=mt_content)
-            except Exception:
-                pass
-
-        # ---- ASSIGNMENTS content (PING ROLES HERE) ----
-        staff_mentions = []
-        for rid in (
-            HEAD_REF_ROLE_ID,
-            REF_ROLE_ID,
-            HEAD_CASTER_ROLE_ID,
-            CASTER_ROLE_ID,
-            COMMENTATOR_ROLE_ID,   # <-- added
-        ):
-            r = guild.get_role(rid)
-            if r:
-                staff_mentions.append(r.mention)
-        staff_header = " ".join(staff_mentions)
-
-        if special:
-            as_content = (
-                f"{staff_header}\n"
-                f"{header}\n"
-                f"> Teams: {self.team1_name} vs {self.team2_name}\n"
-                f"> Time: {self.time}\n"
-                f"> Referee: {ref_text}\n"
-                f"> Caster: {caster_text}\n"
-                f"> Commentator: {comm_text}"
-            )
-        else:
-            as_content = (
-                f"{staff_header}\n"
-                f"{self.team1_name} vs {self.team2_name}\n"
-                f"> WEEK: {self.week}\n"
-                f"> Time: {self.time}\n"
-                f"> Referee: {ref_text}\n"
-                f"> Caster: {caster_text}\n"
-                f"> Commentator: {comm_text}"
-            )
-
-        if isinstance(assignments, discord.TextChannel):
-            as_msg = await self._find_message_to_edit(assignments)
-            try:
-                if as_msg:
-                    await as_msg.edit(content=as_content, view=self)
-            except Exception:
-                pass
-
-        # ---- Per-role assignment channels ----
-        # ALSO include buttons here so caster/commentator channels have the claim UI.
-
-        if isinstance(ref_assign_ch, discord.TextChannel):
-            ref_content = (
-                f"{staff_header}\n"
-                f"{self.team1_name} vs {self.team2_name}\n"
-                f"> WEEK: {self.week}\n"
-                f"> Time: {self.time}\n"
-                f"> Referee: {ref_text}"
-            )
-            try:
-                await ref_assign_ch.send(ref_content, view=self)
-            except Exception:
-                pass
-
-        if isinstance(caster_assign_ch, discord.TextChannel):
-            caster_content = (
-                f"{staff_header}\n"
-                f"{self.team1_name} vs {self.team2_name}\n"
-                f"> WEEK: {self.week}\n"
-                f"> Time: {self.time}\n"
-                f"> Caster: {caster_text}"
-            )
-            try:
-                await caster_assign_ch.send(caster_content, view=self)
-            except Exception:
-                pass
-
-        if isinstance(comment_assign_ch, discord.TextChannel):
-            comm_content = (
-                f"{staff_header}\n"
-                f"{self.team1_name} vs {self.team2_name}\n"
-                f"> WEEK: {self.week}\n"
-                f"> Time: {self.time}\n"
-                f"> Commentator: {comm_text}"
-            )
-            try:
-                await comment_assign_ch.send(comm_content, view=self)
-            except Exception:
-                pass
-
-    # ---------- buttons ----------
-
-    @discord.ui.button(label="Claim Caster", style=discord.ButtonStyle.primary)
-    async def claim_caster(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild = interaction.guild
-        user = interaction.user
-
-        if guild is None:
-            await interaction.response.send_message("Use this in a server.", ephemeral=True)
-            return
-
-        if not self._is_caster_staff(user):
-            await interaction.response.send_message("You must be caster staff to claim Caster.", ephemeral=True)
-            return
-
-        old = self.caster
-        if old is not None and not self._can_override(user, old):
-            await interaction.response.send_message("You cannot override the current Caster for this match.", ephemeral=True)
-            return
-
-        self.caster = user
-
-        await interaction.response.send_message("You claimed Caster.", ephemeral=True)
-        if old and old != user:
-            try:
-                await old.send(f"You were unclaimed as Caster for {self.team1_name} vs {self.team2_name}.")
-            except Exception:
-                pass
-
-        await self._update_messages(interaction)
-
-    @discord.ui.button(label="Claim Referee", style=discord.ButtonStyle.primary)
-    async def claim_ref(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild = interaction.guild
-        user = interaction.user
-
-        if guild is None:
-            await interaction.response.send_message("Use this in a server.", ephemeral=True)
-            return
-
-        if not self._is_ref_staff(user):
-            await interaction.response.send_message("You must be referee staff to claim Referee.", ephemeral=True)
-            return
-
-        old = self.referee
-        if old is not None and not self._can_override(user, old):
-            await interaction.response.send_message("You cannot override the current Referee for this match.", ephemeral=True)
-            return
-
-        self.referee = user
-
-        await interaction.response.send_message("You claimed Referee.", ephemeral=True)
-        if old and old != user:
-            try:
-                await old.send(f"You were unclaimed as Referee for {self.team1_name} vs {self.team2_name}.")
-            except Exception:
-                pass
-
-        await self._update_messages(interaction)
-
-    @discord.ui.button(label="Claim Commentator", style=discord.ButtonStyle.secondary)
-    async def claim_commentator(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild = interaction.guild
-        user = interaction.user
-
-        if guild is None:
-            await interaction.response.send_message("Use this in a server.", ephemeral=True)
-            return
-
-        # commentators can claim (casters can also claim if you want)
-        if not (self._is_commentator_staff(user) or self._is_caster_staff(user)):
-            await interaction.response.send_message("You must be commentator staff to claim Commentator.", ephemeral=True)
-            return
-
-        # Free slot (max 2)
-        if len(self.commentators) < 2 and user not in self.commentators:
-            self.commentators.append(user)
-            await interaction.response.send_message("You claimed Commentator.", ephemeral=True)
-            await self._update_messages(interaction)
-            return
-
-        if user in self.commentators:
-            await interaction.response.send_message("You are already a Commentator for this match.", ephemeral=True)
-            return
-
-        # full (2 commentators) -> override rules in finals/semis only (head staff only)
-        if not self._is_finals_or_semis():
-            await interaction.response.send_message("There are already two commentators for this match.", ephemeral=True)
-            return
-
-        if not self._is_head_staff(user):
-            await interaction.response.send_message("There are already two commentators for this match.", ephemeral=True)
-            return
-
-        overridden = None
-        for old in list(self.commentators):
-            if not self._is_head_staff(old):
-                overridden = old
-                break
-
-        if overridden is None:
-            await interaction.response.send_message("There are already two head staff commentators for this match.", ephemeral=True)
-            return
-
-        self.commentators.remove(overridden)
-        self.commentators.append(user)
-
-        await interaction.response.send_message("You claimed Commentator (override).", ephemeral=True)
-        try:
-            await overridden.send(f"You were unclaimed as Commentator for {self.team1_name} vs {self.team2_name}.")
-        except Exception:
+        except discord.NotFound:
+            # The assignment message was deleted.
+            pass
+        except discord.HTTPException:
+            # Discord rejected the edit.
             pass
 
-        await self._update_messages(interaction)
+    def _user_has_claim(self, match: "MatchAssignment", user_id: int) -> bool:
+        return match.user_has_any_claim(user_id)
 
-    @discord.ui.button(label="Unclaim All", style=discord.ButtonStyle.danger)
-    async def unclaim(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.caster = None
-        self.referee = None
-        self.commentators.clear()
+    def _claim_referee(
+        self,
+        match: "MatchAssignment",
+        user_id: int,
+    ) -> bool:
+        if match.ref_main is None:
+            match.ref_main = user_id
+            return True
 
-        await interaction.response.send_message("All claims cleared.", ephemeral=True)
-        await self._update_messages(interaction)
+        if match.ref_backup is None:
+            match.ref_backup = user_id
+            return True
+
+        return False
+
+    def _claim_caster(
+        self,
+        match: "MatchAssignment",
+        user_id: int,
+    ) -> bool:
+        if match.caster_main is None:
+            match.caster_main = user_id
+            return True
+
+        if match.caster_backup is None:
+            match.caster_backup = user_id
+            return True
+
+        return False
+
+    def _claim_commentator(
+        self,
+        match: "MatchAssignment",
+        user_id: int,
+    ) -> bool:
+        if user_id in match.comm_main or user_id in match.comm_backup:
+            return False
+
+        if len(match.comm_main) < NUM_MAIN_COMMENTATORS:
+            match.comm_main.append(user_id)
+            return True
+
+        if len(match.comm_backup) < NUM_BACKUP_COMMENTATORS:
+            match.comm_backup.append(user_id)
+            return True
+
+        return False
+
+    def _unclaim(
+        self,
+        match: "MatchAssignment",
+        user_id: int,
+    ) -> bool:
+        changed = False
+
+        if match.ref_main == user_id:
+            match.ref_main = None
+            changed = True
+
+        if match.ref_backup == user_id:
+            match.ref_backup = None
+            changed = True
+
+        if match.caster_main == user_id:
+            match.caster_main = None
+            changed = True
+
+        if match.caster_backup == user_id:
+            match.caster_backup = None
+            changed = True
+
+        if user_id in match.comm_main:
+            match.comm_main.remove(user_id)
+            changed = True
+
+        if user_id in match.comm_backup:
+            match.comm_backup.remove(user_id)
+            changed = True
+
+        return changed
+
+    async def _claim(
+        self,
+        interaction: discord.Interaction,
+        claim_function,
+        success_message: str,
+        full_message: str,
+    ) -> None:
+        # Acknowledge the button interaction immediately.
+        await interaction.response.defer(ephemeral=True)
+
+        user_id = interaction.user.id
+
+        async with self._lock:
+            match = self._get_match()
+
+            if match is None:
+                await interaction.followup.send(
+                    "This match is no longer available.",
+                    ephemeral=True,
+                )
+                return
+
+            if self._user_has_claim(match, user_id):
+                await interaction.followup.send(
+                    "You cannot claim more than one assignment.",
+                    ephemeral=True,
+                )
+                return
+
+            claimed = claim_function(match, user_id)
+
+            if not claimed:
+                await interaction.followup.send(
+                    full_message,
+                    ephemeral=True,
+                )
+                return
+
+            await self._refresh_message(interaction)
+
+        await interaction.followup.send(
+            success_message,
+            ephemeral=True,
+        )
+
+    async def _on_claim_ref(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        await self._claim(
+            interaction=interaction,
+            claim_function=self._claim_referee,
+            success_message="You claimed the referee assignment.",
+            full_message="Both referee slots are already full.",
+        )
+
+    async def _on_claim_caster(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        await self._claim(
+            interaction=interaction,
+            claim_function=self._claim_caster,
+            success_message="You claimed the caster assignment.",
+            full_message="Both caster slots are already full.",
+        )
+
+    async def _on_claim_comm(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        await self._claim(
+            interaction=interaction,
+            claim_function=self._claim_commentator,
+            success_message="You claimed the commentator assignment.",
+            full_message="All commentator slots are already full.",
+        )
+
+    async def _on_unclaim(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        user_id = interaction.user.id
+
+        async with self._lock:
+            match = self._get_match()
+
+            if match is None:
+                await interaction.followup.send(
+                    "This match is no longer available.",
+                    ephemeral=True,
+                )
+                return
+
+            removed = self._unclaim(match, user_id)
+
+            if not removed:
+                await interaction.followup.send(
+                    "You do not have an assignment claimed here.",
+                    ephemeral=True,
+                )
+                return
+
+            await self._refresh_message(interaction)
+
+        await interaction.followup.send(
+            "You successfully unclaimed your assignment.",
+            ephemeral=True,
+        )
+
+
+MAIN_ALERT_TEXT = (
+    "# 🚨 SCRIM ALERT 🚨\n"
+    "You are receiving this because you’re a **Ref, Caster, or Commentator** for a PGL official in 10 minutes "
+    "so please, click the accept button if you can make it, if you can’t, then click the deny button, "
+    "then we will find a backup caster, ref, or commentator that will take your spot."
+)
+
+BACKUP_ALERT_TEXT = (
+    "# 🚨 SCRIM ALERT 🚨\n"
+    "You are receiving this because you’re a backup **Ref, Caster, or Commentator** for a PGL official in 10 minutes "
+    "so please, click the accept button if you can make it, if you can’t, then click the deny button, "
+    "then we will find a new backup caster, ref, or commentator that will take your backup spot."
+)
+
+class ScrimAlertDMView(discord.ui.View):
+    def __init__(self, match_id: str, role_type: RoleType, is_backup: bool, target_user_id: int):
+        super().__init__(timeout=60 * 60)  # 1 hour
+        self.match_id = match_id
+        self.role_type = role_type
+        self.is_backup = is_backup
+        self.target_user_id = target_user_id
+
+    def _still_assigned(self, m: MatchAssignment) -> bool:
+        uid = self.target_user_id
+        if self.role_type == "ref":
+            return (m.ref_backup == uid) if self.is_backup else (m.ref_main == uid)
+        if self.role_type == "caster":
+            return (m.caster_backup == uid) if self.is_backup else (m.caster_main == uid)
+        # commentator: membership in list
+        return (uid in m.comm_backup) if self.is_backup else (uid in m.comm_main)
+
+    def _remove_assignment(self, m: MatchAssignment) -> bool:
+        uid = self.target_user_id
+        changed = False
+
+        if self.role_type == "ref":
+            if self.is_backup and m.ref_backup == uid:
+                m.ref_backup = None; changed = True
+            if (not self.is_backup) and m.ref_main == uid:
+                m.ref_main = None; changed = True
+
+        elif self.role_type == "caster":
+            if self.is_backup and m.caster_backup == uid:
+                m.caster_backup = None; changed = True
+            if (not self.is_backup) and m.caster_main == uid:
+                m.caster_main = None; changed = True
+
+        else:  # commentator
+            if self.is_backup and uid in m.comm_backup:
+                m.comm_backup = [x for x in m.comm_backup if x != uid]; changed = True
+            if (not self.is_backup) and uid in m.comm_main:
+                m.comm_main = [x for x in m.comm_main if x != uid]; changed = True
+
+        return changed
+
+    async def _log_and_refresh(self, interaction: discord.Interaction, note: str):
+        m = MATCHES.get(self.match_id)
+        if not m:
+            return
+
+        guild = interaction.client.get_guild(m.guild_id)
+        if not guild:
+            return
+
+        log_ch = guild.get_channel(ALERT_LOG_CHANNEL_ID)
+        if isinstance(log_ch, discord.TextChannel):
+            try:
+                await log_ch.send(note, allowed_mentions=discord.AllowedMentions(roles=False, users=True, everyone=False))
+            except Exception:
+                pass
+
+        # refresh the assignment message
+        ch = guild.get_channel(m.channel_id)
+        if isinstance(ch, discord.TextChannel):
+            try:
+                msg = await ch.fetch_message(m.message_id)
+                await msg.edit(content=render_assignment_post(guild, m), view=AssignmentClaimView(m.match_id))
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success)
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.target_user_id:
+            await interaction.response.send_message("This isn’t for you.", ephemeral=True)
+            return
+
+        m = MATCHES.get(self.match_id)
+        if not m or not self._still_assigned(m):
+            await interaction.response.send_message("You’re no longer assigned to this.", ephemeral=True)
+            return
+
+        await interaction.response.send_message("Accepted. Thank you.", ephemeral=True)
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
+        self.stop()
+
+    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger)
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.target_user_id:
+            await interaction.response.send_message("This isn’t for you.", ephemeral=True)
+            return
+
+        m = MATCHES.get(self.match_id)
+        if not m or not self._still_assigned(m):
+            await interaction.response.send_message("You’re no longer assigned to this.", ephemeral=True)
+            return
+
+        self._remove_assignment(m)
+
+        await interaction.response.send_message("Denied. We’ll find a replacement.", ephemeral=True)
+
+        who = f"<@{self.target_user_id}>"
+        slot = f"{self.role_type.upper()} ({'BACKUP' if self.is_backup else 'MAIN'})"
+        note = f"{who} denied **{slot}** for: **{m.team1_name} vs {m.team2_name}** at **{m.time_str}**. Need replacement."
+
+        await self._log_and_refresh(interaction, note)
+
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
+        self.stop()
+
+
+async def dm_user_safe(user: discord.User | discord.Member, content: str, view: discord.ui.View):
+    try:
+        await user.send(content, view=view)
+    except Exception:
+        pass
+
+async def send_scrim_alerts_if_due(bot: commands.Bot):
+    now = datetime.now(timezone.utc)
+
+    for m in list(MATCHES.values()):
+        # Only process if starts_at_utc is valid
+        if not isinstance(m.starts_at_utc, datetime):
+            continue
+
+        delta = m.starts_at_utc - now
+        if delta > timedelta(minutes=10):
+            continue
+        if delta < timedelta(minutes=-60):
+            continue  # too old; ignore
+
+        guild = bot.get_guild(m.guild_id)
+        if not guild:
+            continue
+
+        # MAIN alerts (once)
+        if not m.alerted_main:
+            main_targets: List[tuple[RoleType, int, bool]] = []
+            if m.ref_main: main_targets.append(("ref", m.ref_main, False))
+            if m.caster_main: main_targets.append(("caster", m.caster_main, False))
+            for uid in m.comm_main:
+                main_targets.append(("commentator", uid, False))
+
+            for role_type, uid, is_backup in main_targets:
+                user = bot.get_user(uid) or await bot.fetch_user(uid)
+                view = ScrimAlertDMView(m.match_id, role_type, is_backup, uid)
+                await dm_user_safe(user, MAIN_ALERT_TEXT, view)
+
+            m.alerted_main = True
+
+        # BACKUP alerts (once)
+        if not m.alerted_backup:
+            backup_targets: List[tuple[RoleType, int, bool]] = []
+            if m.ref_backup: backup_targets.append(("ref", m.ref_backup, True))
+            if m.caster_backup: backup_targets.append(("caster", m.caster_backup, True))
+            for uid in m.comm_backup:
+                backup_targets.append(("commentator", uid, True))
+
+            for role_type, uid, is_backup in backup_targets:
+                user = bot.get_user(uid) or await bot.fetch_user(uid)
+                view = ScrimAlertDMView(m.match_id, role_type, is_backup, uid)
+                await dm_user_safe(user, BACKUP_ALERT_TEXT, view)
+
+            m.alerted_backup = True
+
+
+class ScrimAlertLoop(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self.task = bot.loop.create_task(self._loop())
+
+    async def _loop(self):
+        await self.bot.wait_until_ready()
+        while not self.bot.is_closed():
+            try:
+                await send_scrim_alerts_if_due(self.bot)
+            except Exception:
+                pass
+            await asyncio.sleep(30)  # check twice a minute
 
 
 
@@ -3544,7 +3783,7 @@ class TimeAcceptView(discord.ui.View):
         await self._finalize_if_ready(interaction)
 
 
-# ---------------- FIXED ForceTimeView ----------------
+# ---------------- UPDATED ForceTimeView ----------------
 class ForceTimeView(discord.ui.View):
     def __init__(
         self,
@@ -3555,6 +3794,7 @@ class ForceTimeView(discord.ui.View):
         team1_name: str,
         team2_name: str,
         time_str: str,
+        starts_at_utc: datetime,  # NEW (timezone-aware UTC datetime)
     ):
         super().__init__(timeout=None)
         self.team1_role = team1_role
@@ -3564,22 +3804,23 @@ class ForceTimeView(discord.ui.View):
         self.team1_name = team1_name
         self.team2_name = team2_name
         self.time_str = time_str
+        self.starts_at_utc = self._ensure_utc(starts_at_utc)
+
+    def _ensure_utc(self, dt: datetime) -> datetime:
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
 
     def _build_forced_message(self) -> str:
         return f"{self.team1_mention} {self.team2_mention} Your day to play is: {self.time_str}"
 
     def _build_staff_message(self, guild: discord.Guild) -> str:
-        staff_mentions = []
-        for rid in (
-            BOARD_OF_DIRECTORS_ROLE_ID,
-            COMMUNITY_MANAGER_ROLE_ID,
-            SUPERVISOR_ROLE_ID,
-            DEVELOPMENT_TEAM_ROLE_ID,
-        ):
-            r = guild.get_role(rid)
-            if r:
-                staff_mentions.append(r.mention)
-        staff_header = " ".join(staff_mentions) or ""
+        # Use whichever staff ping builder you prefer.
+        # If you don't have build_staff_ping_header, replace it with your old staff_mentions logic.
+        try:
+            staff_header = build_staff_ping_header(guild)
+        except Exception:
+            staff_header = ""
 
         return (
             f"{staff_header}\n"
@@ -3609,6 +3850,11 @@ class ForceTimeView(discord.ui.View):
                 return ch
         return None
 
+    def _disable_buttons(self):
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+
     @discord.ui.button(label="Accept", style=discord.ButtonStyle.success)
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild = interaction.guild
@@ -3620,11 +3866,16 @@ class ForceTimeView(discord.ui.View):
             await interaction.response.send_message("Only admins can accept.", ephemeral=True)
             return
 
+        # 1) Find scheduling channel
         sched_ch = self._find_scheduling_channel(guild)
         if not isinstance(sched_ch, discord.TextChannel):
-            await interaction.response.send_message("Could not find a scheduling channel for these teams.", ephemeral=True)
+            await interaction.response.send_message(
+                "Could not find a scheduling channel for these teams.",
+                ephemeral=True,
+            )
             return
 
+        # 2) Post forced time message into scheduling channel
         try:
             await sched_ch.send(self._build_forced_message())
         except Exception:
@@ -3633,8 +3884,9 @@ class ForceTimeView(discord.ui.View):
 
         week = "Forced"
         time_str = self.time_str
+        starts_at_utc = self._ensure_utc(self.starts_at_utc)
 
-        # ---- MATCH_TIMES ----
+        # 3) MATCH_TIMES entry
         match_times = guild.get_channel(MATCH_TIMES_CHANNEL_ID)
         if isinstance(match_times, discord.TextChannel):
             mt_content = (
@@ -3643,36 +3895,37 @@ class ForceTimeView(discord.ui.View):
                 f"> Time: {time_str}\n"
                 f"> Referee: \n"
                 f"> Caster: \n"
-                f"> Commentator: "
+                f"> Commentators: "
             )
             try:
                 await match_times.send(mt_content)
             except Exception:
                 pass
 
-        # ---- ASSIGNMENT CHANNELS (PING ONCE TOTAL) ----
-        view = AssignmentClaimView(week=week, time=time_str, team1_name=self.team1_name, team2_name=self.team2_name)
-
-        def build_msg(prefix: str, _channel_id: int) -> str:
-            return (
-                f"{prefix}{self.team1_name} vs {self.team2_name}\n"
-                f"> WEEK: {week}\n"
-                f"> Time: {time_str}\n"
-                f"> Referee: \n"
-                f"> Caster: \n"
-                f"> Commentator: "
+        # 4) SINGLE consolidated assignments post (with claim buttons + alert scheduling)
+        try:
+            await post_single_assignment_message(
+                guild=guild,
+                team1_name=self.team1_name,
+                team2_name=self.team2_name,
+                week=week,
+                time_str=time_str,
+                starts_at_utc=starts_at_utc,
             )
+        except Exception:
+            await interaction.response.send_message(
+                f"Forced time posted in {sched_ch.mention}, but failed to create the assignments post.",
+                ephemeral=True,
+            )
+            return
 
-        await send_to_assignment_channels_ping_once(guild=guild, content_builder=build_msg, view=view)
-
+        # 5) Finish interaction + disable staff prompt buttons
         await interaction.response.send_message(
-            f"Forced time posted in {sched_ch.mention} and scheduling records updated.",
+            f"Forced time posted in {sched_ch.mention} and assignments created.",
             ephemeral=True,
         )
 
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.disabled = True
+        self._disable_buttons()
         try:
             await interaction.message.edit(view=self)
         except Exception:
@@ -3690,7 +3943,16 @@ class ForceTimeView(discord.ui.View):
             await interaction.response.send_message("Only admins can deny.", ephemeral=True)
             return
 
-        self.time_str = generate_forced_time_string()
+        # Must regenerate BOTH the display string AND the datetime used for 10-min alerts
+        try:
+            new_time_str, new_starts_at_utc = generate_forced_time()
+        except Exception:
+            await interaction.response.send_message("Failed to pick a new time.", ephemeral=True)
+            return
+
+        self.time_str = new_time_str
+        self.starts_at_utc = self._ensure_utc(new_starts_at_utc)
+
         new_content = self._build_staff_message(guild)
         try:
             await interaction.message.edit(content=new_content, view=self)
@@ -4193,6 +4455,7 @@ class ScrimCheckCog(commands.Cog):
 
 
 # ---------------- ForceTimeCog ----------------
+
 class ForceTimeCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -4204,36 +4467,91 @@ class ForceTimeCog(commands.Cog):
         description="Force a match time between two teams (admins only).",
     )
     @app_commands.describe(
-        team1="Team 1 (mention / name / id)",
-        team2="Team 2 (mention / name / id)",
+        team1="Team 1 (mention / name / ID)",
+        team2="Team 2 (mention / name / ID)",
     )
-    async def force_time(self, interaction: discord.Interaction, team1: str, team2: str):
+    async def force_time(
+        self,
+        interaction: discord.Interaction,
+        team1: str,
+        team2: str,
+    ):
         guild = interaction.guild
+
         if guild is None:
-            await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            await interaction.response.send_message(
+                "Use this command in a server.",
+                ephemeral=True,
+            )
             return
 
         if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
+            await interaction.response.send_message(
+                "You do not have permission to use this command.",
+                ephemeral=True,
+            )
             return
 
-        # resolve teams
-        t1_role, t1_mention, t1_name = resolve_team_any(guild, team1)
-        t2_role, t2_mention, t2_name = resolve_team_any(guild, team2)
-
-        if not t1_mention or not t2_mention:
-            await interaction.response.send_message("Could not resolve one or both teams.", ephemeral=True)
+        # Resolve both teams
+        try:
+            t1_role, t1_mention, t1_name = resolve_team_any(guild, team1)
+            t2_role, t2_mention, t2_name = resolve_team_any(guild, team2)
+        except Exception:
+            await interaction.response.send_message(
+                "There was an error while resolving the teams.",
+                ephemeral=True,
+            )
             return
 
-        # pick an initial forced time
-        time_str = generate_forced_time_string()
+        if not t1_mention or not t1_name:
+            await interaction.response.send_message(
+                f"Could not resolve Team 1: `{team1}`",
+                ephemeral=True,
+            )
+            return
 
-        # staff review channel (fixed)
+        if not t2_mention or not t2_name:
+            await interaction.response.send_message(
+                f"Could not resolve Team 2: `{team2}`",
+                ephemeral=True,
+            )
+            return
+
+        if t1_name.lower() == t2_name.lower():
+            await interaction.response.send_message(
+                "Team 1 and Team 2 must be different teams.",
+                ephemeral=True,
+            )
+            return
+
+        # Generate both the display text and the real UTC match time.
+        # The datetime is required by the 10-minute alert system.
+        try:
+            time_str, starts_at_utc = generate_forced_time()
+        except Exception:
+            await interaction.response.send_message(
+                "Failed to generate a forced match time.",
+                ephemeral=True,
+            )
+            return
+
+        # Ensure the datetime is timezone-aware UTC.
+        if starts_at_utc.tzinfo is None:
+            starts_at_utc = starts_at_utc.replace(tzinfo=timezone.utc)
+        else:
+            starts_at_utc = starts_at_utc.astimezone(timezone.utc)
+
+        # Find the staff review channel.
         review_ch = guild.get_channel(FORCE_TIME_REVIEW_CHANNEL_ID)
+
         if not isinstance(review_ch, discord.TextChannel):
-            await interaction.response.send_message("Review channel is not configured correctly.", ephemeral=True)
+            await interaction.response.send_message(
+                "The force-time review channel is not configured correctly.",
+                ephemeral=True,
+            )
             return
 
+        # Create the Accept/Deny view.
         view = ForceTimeView(
             team1_role=t1_role,
             team2_role=t2_role,
@@ -4242,18 +4560,42 @@ class ForceTimeCog(commands.Cog):
             team1_name=t1_name,
             team2_name=t2_name,
             time_str=time_str,
+            starts_at_utc=starts_at_utc,
         )
 
+        # Build the staff review message.
         staff_message = view._build_staff_message(guild)
 
         try:
-            await review_ch.send(staff_message, view=view)
+            await review_ch.send(
+                content=staff_message,
+                view=view,
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "I do not have permission to post in the review channel.",
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException:
+            await interaction.response.send_message(
+                "Discord rejected the review message.",
+                ephemeral=True,
+            )
+            return
         except Exception:
-            await interaction.response.send_message("Failed to post review message.", ephemeral=True)
+            await interaction.response.send_message(
+                "Failed to post the force-time review message.",
+                ephemeral=True,
+            )
             return
 
         await interaction.response.send_message(
-            f"Proposed forced time created for {t1_mention} vs {t2_mention} and sent to {review_ch.mention}.",
+            (
+                f"Forced time created for {t1_mention} vs {t2_mention}.\n"
+                f"Proposed time: **{time_str}**\n"
+                f"Staff approval was sent to {review_ch.mention}."
+            ),
             ephemeral=True,
         )
 
@@ -5792,7 +6134,11 @@ bot = MainBot()
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    for match_id, assignment in MATCHES.items():
+        bot.add_view(
+            AssignmentClaimView(match_id),
+            message_id=assignment.assignments_message_id,
+        )
 
 if __name__ == "__main__":
     bot.run(os.getenv("BOT_TOKEN"))
