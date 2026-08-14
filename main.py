@@ -22,8 +22,6 @@ from typing import Optional  # add List only if you truly still use List[...]
 MATCHES: dict[str, MatchAssignment] = {}
 MATCHES: dict[str, "MatchAssignment"] = {}
 
-from .assignments_state import MATCHES, MatchAssignment, RoleType
-
 load_dotenv()
 
 
@@ -177,30 +175,30 @@ def format_list_arrow(items: list[str]) -> str:
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
+
+RoleType = Literal["ref", "caster", "commentator"]
+
+MATCHES: dict[str, "MatchAssignment"] = {}
 
 
 @dataclass
 class MatchAssignment:
-    match_id: str
     guild_id: int
-    team1_name: str
-    team2_name: str
-    week: str
-    time_str: str
+    match_id: str
     starts_at_utc: datetime
-    assignments_channel_id: int
-    assignments_message_id: int
-
-    ref_main: Optional[int] = None
-    ref_backup: Optional[int] = None
-    caster_main: Optional[int] = None
-    caster_backup: Optional[int] = None
-    comm_main: Optional[int] = None
-    comm_backup: Optional[int] = None
 
     alerted_main: bool = False
     alerted_backup: bool = False
+
+    ref_main: Optional[int] = None
+    ref_backup: Optional[int] = None
+
+    caster_main: Optional[int] = None
+    caster_backup: Optional[int] = None
+
+    comm_main: Optional[int] = None
+    comm_backup: Optional[int] = None
 
 
 
