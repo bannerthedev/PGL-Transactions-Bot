@@ -1070,179 +1070,48 @@ class CreateTeamModal(discord.ui.Modal, title="Create Team"):
 
 
 class AdminPanelView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
+    def __init__(
+        self,
+        *,
+        starts_at_utc: datetime,
+        team1_role: discord.Role,
+        team2_role: discord.Role,
+        team1_mention: str,
+        team2_mention: str,
+        team1_name: str,
+        team2_name: str,
+        timeout: float = 900,
+    ):
+        super().__init__(timeout=timeout)
 
-    @discord.ui.button(label="roster lock all", style=discord.ButtonStyle.danger)
-    async def roster_lock_all(self, interaction, button):
-        global ROSTER_LOCKED
-        guild = interaction.guild
-        tx = guild.get_channel(TRANSACTIONS_CHANNEL_ID) if guild else None
-        ROSTER_LOCKED = True
-        if tx:
-            try:
-                await tx.send("# ROSTER LOCK HAS BEEN ENABLED FOR ALL TEAM!")
-            except Exception:
-                pass
-        await interaction.response.send_message("Rosters locked for all teams.", ephemeral=True)
+        self.starts_at_utc = starts_at_utc
+        self.team1_role = team1_role
+        self.team2_role = team2_role
+        self.team1_mention = team1_mention
+        self.team2_mention = team2_mention
+        self.team1_name = team1_name
+        self.team2_name = team2_name
 
-    @discord.ui.button(label="disband all", style=discord.ButtonStyle.danger)
-    async def disband_all(self, interaction, button):
-        """
-        Disband ONLY teams that are registered in teams.json (load_teams).
-        Leaves all other server roles alone.
-        """
-        guild = interaction.guild
-        if guild is None:
-            await interaction.response.send_message("Use this in a server.", ephemeral=True)
-            return
-
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        # 1) Load known team roles from teams.json
-        teams_data = load_teams()
-        team_role_ids: set[int] = set()
-        for entry in teams_data:
-            rid = entry.get("role_id")
-            if not rid:
-                continue
-            try:
-                team_role_ids.add(int(rid))
-            except (TypeError, ValueError):
-                continue
-
-        if not team_role_ids:
-            await interaction.followup.send("No teams found in teams.json; nothing to disband.", ephemeral=True)
-            return
-
-        # 2) Resolve actual Role objects for those IDs
-        team_roles: list[discord.Role] = []
-        for rid in team_role_ids:
-            r = guild.get_role(rid)
-            if r and not r.is_default() and not r.managed:
-                team_roles.append(r)
-
-        if not team_roles:
-            await interaction.followup.send("No valid team roles found on this server.", ephemeral=True)
-            return
-
-        # 3) Prepare global roles to strip only from members who had a team role
-        global_role_ids = {
-            CAPTAIN_ROLE_ID,
-            CO_CAPTAIN_ROLE_ID,
-            TEAM_PLAYER_ROLE_ID,
-            TEAM_EXEC_ROLE_ID,
-        }
-        global_roles = {rid: guild.get_role(rid) for rid in global_role_ids if rid}
-
-        # 4) For each member, if they have ANY team role -> remove team + global roles
-        for member in guild.members:
-            if member.bot:
-                continue
-            member_team_roles = [r for r in member.roles if r.id in team_role_ids]
-            if not member_team_roles:
-                continue
-
-            roles_to_remove = list(member_team_roles)
-            for r in global_roles.values():
-                if r and r in member.roles:
-                    roles_to_remove.append(r)
-
-            if roles_to_remove:
-                try:
-                    await member.remove_roles(
-                        *roles_to_remove,
-                        reason=f"Disband-all teams by {interaction.user}",
-                    )
-                except Exception:
-                    pass  # best-effort
-
-        # 5) Delete ONLY the team roles, leave all other roles intact
-        deleted_count = 0
-        for r in team_roles:
-            try:
-                await r.delete(reason=f"Disband-all teams by {interaction.user}")
-                deleted_count += 1
-            except Exception:
-                pass  # best-effort
-
-        # 6) Optional: clean teams.json (remove teams whose roles no longer exist)
-        cleaned: list[dict] = []
-        for entry in teams_data:
-            rid = entry.get("role_id")
-            if not rid:
-                continue
-            try:
-                rid_int = int(rid)
-            except (TypeError, ValueError):
-                continue
-            # keep only teams whose role still exists
-            if guild.get_role(rid_int) is not None:
-                cleaned.append(entry)
-        try:
-            with TEAMS_FILE.open("w", encoding="utf-8") as f:
-                json.dump(cleaned, f, indent=2)
-        except Exception:
-            pass
-
-        # 7) Log to transactions and reply
-        tx = guild.get_channel(TRANSACTIONS_CHANNEL_ID)
-        if isinstance(tx, discord.TextChannel):
-            try:
-                await tx.send("# ALL REGISTERED TEAMS HAVE BEEN DISBANDED")
-            except Exception:
-                pass
-
-        await interaction.followup.send(
-            f"Disbanded {deleted_count} team roles and stripped their members' team/global roles.",
-            ephemeral=True,
+    @discord.ui.button(
+        label="submit time",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def submit_time(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        modal = SubmitTimeModal(
+            starts_at_utc=self.starts_at_utc,
+            team1_role=self.team1_role,
+            team2_role=self.team2_role,
+            team1_mention=self.team1_mention,
+            team2_mention=self.team2_mention,
+            team1_name=self.team1_name,
+            team2_name=self.team2_name,
         )
 
-    @discord.ui.button(label="add scrim", style=discord.ButtonStyle.primary)
-    async def add_scrim(self, interaction, button):
-        await interaction.response.send_modal(AddScrimModal())
-
-    @discord.ui.button(label="submit score", style=discord.ButtonStyle.success)
-    async def submit_score(self, interaction, button):
-        global SEEDING_OPEN
-        if SEEDING_OPEN:
-            await interaction.response.send_modal(SubmitScoreModalSeeding())
-        else:
-            await interaction.response.send_modal(SubmitScoreModalNoSeeding())
-
-    @discord.ui.button(label="submit time", style=discord.ButtonStyle.secondary)
-    async def submit_time(self, interaction, button):
-        await interaction.response.send_modal(SubmitTimeModal())
-
-    @discord.ui.button(label="create team", style=discord.ButtonStyle.primary)
-    async def create_team(self, interaction, button):
-        await interaction.response.send_modal(CreateTeamModal())
-
-    @discord.ui.button(label="Admin Add", style=discord.ButtonStyle.success)
-    async def admin_add(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(AdminAddModal())
-
-    @discord.ui.button(label="Admin Kick", style=discord.ButtonStyle.danger)
-    async def admin_kick(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(AdminKickModal())
-
-    @discord.ui.button(label="unlock roster all", style=discord.ButtonStyle.success)
-    async def unlock_roster_all(self, interaction: discord.Interaction, button: discord.ui.Button):
-        global ROSTER_LOCKED
-        guild = interaction.guild
-        if guild is None:
-            await interaction.response.send_message("Use this in a server.", ephemeral=True)
-            return
-
-        ROSTER_LOCKED = False
-        tx = guild.get_channel(TRANSACTIONS_CHANNEL_ID)
-        if isinstance(tx, discord.TextChannel):
-            try:
-                await tx.send("# ALL ROSTERS HAVE BEEN UNLOCKED BY AN ADMIN")
-            except Exception:
-                pass
-
-        await interaction.response.send_message("All rosters unlocked.", ephemeral=True)
+        await interaction.response.send_modal(modal)
 
 
 class AdminPanel(commands.Cog):
@@ -3665,7 +3534,7 @@ def ensure_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
-class SubmitTimeModal(discord.ui.Modal, title="Confirm Match Time"):
+class SubmitTimeModal(discord.ui.Modal, title="Submit Match Time"):
     def __init__(
         self,
         *,
@@ -3679,7 +3548,7 @@ class SubmitTimeModal(discord.ui.Modal, title="Confirm Match Time"):
     ):
         super().__init__()
 
-        self.starts_at_utc = ensure_utc(starts_at_utc)
+        self.starts_at_utc = starts_at_utc.astimezone(timezone.utc)
         self.team1_role = team1_role
         self.team2_role = team2_role
         self.team1_mention = team1_mention
@@ -3687,14 +3556,14 @@ class SubmitTimeModal(discord.ui.Modal, title="Confirm Match Time"):
         self.team1_name = team1_name
         self.team2_name = team2_name
 
-        self.confirmation = discord.ui.TextInput(
-            label="Confirmation",
-            placeholder="Type CONFIRM to create this assignment",
+        self.time_input = discord.ui.TextInput(
+            label="Match time",
+            placeholder="Example: 20:30 UTC",
             required=True,
-            max_length=20,
+            max_length=50,
         )
 
-        self.add_item(self.confirmation)
+        self.add_item(self.time_input)
 
     async def on_submit(self, interaction: discord.Interaction):
         if self.confirmation.value.strip().upper() != "CONFIRM":
