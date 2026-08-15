@@ -3397,106 +3397,63 @@ class TimeAcceptModal(discord.ui.Modal, title="Accept Match Time"):
 # Time parsing and UTC handling
 # -----------------------------
 
-def ensure_utc(value: datetime) -> datetime:
+from datetime import datetime, timezone
+import discord
+
+
+def ensure_utc(value: datetime | None) -> datetime | None:
     """Return a timezone-aware UTC datetime."""
+    if value is None:
+        return None
+
     if value.tzinfo is None:
-        # Treat a timezone-less value as UTC.
-        value = value.replace(tzinfo=timezone.utc)
+        return value.replace(tzinfo=timezone.utc)
 
     return value.astimezone(timezone.utc)
 
 
 def parse_match_time(value: str) -> datetime:
     """
-    Parse the time entered in the modal.
+    Expected format:
+        YYYY-MM-DD HH:MM UTC
 
-    Supported examples:
-
-        2026-08-20 20:00 UTC
-        2026-08-20 20:00
-        2026-08-20T20:00:00+00:00
-        2026-08-20 20:00 America/New_York is not supported here
-
-    If no timezone is included, UTC is assumed.
+    Example:
+        2026-08-20 19:30 UTC
     """
+    value = value.strip().upper()
 
-    value = value.strip()
+    if value.endswith(" UTC"):
+        value = value[:-4].strip()
 
-    if not value:
-        raise ValueError("Please enter a match time.")
+    parsed = datetime.strptime(value, "%Y-%m-%d %H:%M")
+    return parsed.replace(tzinfo=timezone.utc)
 
-    # Convert a trailing UTC marker into an ISO-compatible offset.
-    normalized = re.sub(
-        r"\s+(UTC|GMT)$",
-        "+00:00",
-        value,
-        flags=re.IGNORECASE,
-    )
-
-    formats = (
-        "%Y-%m-%d %H:%M %z",
-        "%Y-%m-%d %H:%M:%S %z",
-        "%Y-%m-%dT%H:%M %z",
-        "%Y-%m-%dT%H:%M:%S %z",
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M",
-        "%Y-%m-%dT%H:%M:%S",
-    )
-
-    parsed: Optional[datetime] = None
-
-    # Try ISO parsing first.
-    try:
-        parsed = datetime.fromisoformat(normalized)
-    except ValueError:
-        pass
-
-    # Then try the explicit formats.
-    if parsed is None:
-        for time_format in formats:
-            try:
-                parsed = datetime.strptime(normalized, time_format)
-                break
-            except ValueError:
-                continue
-
-    if parsed is None:
-        raise ValueError(
-            "Invalid time format. Use `YYYY-MM-DD HH:MM UTC`, "
-            "for example `2026-08-20 20:00 UTC`."
-        )
-
-    return ensure_utc(parsed)
-
-
-# -----------------------------
-# Submit time modal
-# -----------------------------
 
 class SubmitTimeModal(discord.ui.Modal, title="Submit Match Details"):
     week = discord.ui.TextInput(
         label="Week",
         placeholder="Example: Week 3",
+        required=False,
+        max_length=50,
+    )
+
+    match_time = discord.ui.TextInput(
+        label="Match time",
+        placeholder="YYYY-MM-DD HH:MM UTC",
         required=True,
         max_length=30,
     )
 
-    match_time = discord.ui.TextInput(
-        label="Time",
-        placeholder="Example: 2026-08-22 20:00 UTC",
-        required=True,
-        max_length=50,
-    )
-
-    team1_name_input = discord.ui.TextInput(
-        label="Team 1 name",
+    team1_name = discord.ui.TextInput(
+        label="Team 1",
+        placeholder="Team 1 name",
         required=True,
         max_length=100,
     )
 
-    team2_name_input = discord.ui.TextInput(
-        label="Team 2 name",
+    team2_name = discord.ui.TextInput(
+        label="Team 2",
+        placeholder="Team 2 name",
         required=True,
         max_length=100,
     )
@@ -3511,6 +3468,186 @@ class SubmitTimeModal(discord.ui.Modal, title="Submit Match Details"):
 
         self.parent_view = parent_view
         self.original_message = original_message
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            starts_at_utc = parse_match_time(str(self.match_time.value))
+        except ValueError:
+            await interaction.response.send_message(
+                "Invalid time format. Use `YYYY-MM-DD HH:MM UTC`.",
+                ephemeral=True,
+            )
+            return
+
+        # Save the submitted values back to the ForceTimeView.
+        self.parent_view.week = str(self.week.value).strip()
+        self.parent_view.time_str = str(self.match_time.value).strip()
+        self.parent_view.starts_at_utc = starts_at_utc
+        self.parent_view.team1_name = str(self.team1_name.value).strip()
+        self.parent_view.team2_name = str(self.team2_name.value).strip()
+
+        await interaction.response.edit_message(
+            content=self.parent_view._build_staff_message(interaction.guild),
+            view=self.parent_view,
+        )
+
+
+class ForceTimeView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        team1_role: discord.Role,
+        team2_role: discord.Role,
+        team1_mention: str,
+        team2_mention: str,
+        team1_name: str,
+        team2_name: str,
+        time_str: str,
+        starts_at_utc: datetime,
+        week: str = "",
+    ):
+        super().__init__(timeout=None)
+
+        self.team1_role = team1_role
+        self.team2_role = team2_role
+
+        self.team1_mention = team1_mention
+        self.team2_mention = team2_mention
+
+        self.team1_name = team1_name
+        self.team2_name = team2_name
+
+        self.time_str = time_str
+        self.starts_at_utc = ensure_utc(starts_at_utc)
+        self.week = week
+
+        self.original_message: discord.Message | None = None
+
+    def _build_staff_message(self, guild: discord.Guild | None) -> str:
+        return (
+            "⚔️ **Forced Match Time**\n\n"
+            f"**Week:** {self.week or 'Not specified'}\n"
+            f"**Time:** {self.time_str}\n"
+            f"**Team 1:** {self.team1_mention} ({self.team1_name})\n"
+            f"**Team 2:** {self.team2_mention} ({self.team2_name})\n\n"
+            "Staff: choose **Accept**, **Deny**, or **Edit Time**."
+        )
+
+    @discord.ui.button(
+        label="Edit Time",
+        style=discord.ButtonStyle.primary,
+        custom_id="force_time_edit",
+    )
+    async def submit_time(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        try:
+            modal = SubmitTimeModal(
+                parent_view=self,
+                original_message=interaction.message,
+            )
+
+            await interaction.response.send_modal(modal)
+
+        except Exception:
+            logger.exception("Could not open SubmitTimeModal")
+
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "Could not open the time submission form.",
+                    ephemeral=True,
+                )
+
+    @discord.ui.button(
+        label="Accept",
+        style=discord.ButtonStyle.success,
+        custom_id="force_time_accept",
+    )
+    async def accept(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        try:
+            if self.starts_at_utc is None:
+                await interaction.response.send_message(
+                    "A valid match start time is required.",
+                    ephemeral=True,
+                )
+                return
+
+            self.starts_at_utc = ensure_utc(self.starts_at_utc)
+
+            # Disable all buttons after acceptance.
+            for child in self.children:
+                if isinstance(child, discord.ui.Button):
+                    child.disabled = True
+
+            await interaction.response.edit_message(
+                content=(
+                    "✅ **Forced match accepted.**\n\n"
+                    f"**Week:** {self.week or 'Not specified'}\n"
+                    f"**Time:** {self.time_str}\n"
+                    f"**Team 1:** {self.team1_mention} ({self.team1_name})\n"
+                    f"**Team 2:** {self.team2_mention} ({self.team2_name})"
+                ),
+                view=self,
+            )
+
+            # Call your scheduling function here using the exact signature
+            # of your actual function.
+            #
+            # Example:
+            #
+            # await post_single_assignment_message(
+            #     guild=interaction.guild,
+            #     starts_at_utc=self.starts_at_utc,
+            #     time_str=self.time_str,
+            #     team1_role=self.team1_role,
+            #     team2_role=self.team2_role,
+            #     team1_name=self.team1_name,
+            #     team2_name=self.team2_name,
+            # )
+
+        except Exception:
+            logger.exception("Error while accepting forced match")
+
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "An error occurred while accepting the forced match.",
+                    ephemeral=True,
+                )
+
+    @discord.ui.button(
+        label="Deny",
+        style=discord.ButtonStyle.danger,
+        custom_id="force_time_deny",
+    )
+    async def deny(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        try:
+            for child in self.children:
+                if isinstance(child, discord.ui.Button):
+                    child.disabled = True
+
+            await interaction.response.edit_message(
+                content="❌ **Forced match denied.**",
+                view=self,
+            )
+
+        except Exception:
+            logger.exception("Error while denying forced match")
+
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "An error occurred while denying the forced match.",
+                    ephemeral=True,
+                )
 
 # -----------------------------
 # Admin panel view
@@ -3600,178 +3737,6 @@ class AdminPanelView(discord.ui.View):
     async def on_timeout(self) -> None:
         for child in self.children:
             child.disabled = True
-
-
-class ForceTimeView(discord.ui.View):
-    def __init__(
-        self,
-        *,
-        team1_role: discord.Role,
-        team2_role: discord.Role,
-        team1_mention: str,
-        team2_mention: str,
-        team1_name: str,
-        team2_name: str,
-        time_str: str,
-        starts_at_utc: datetime,
-        timeout: Optional[float] = 3600,
-    ):
-        super().__init__(timeout=timeout)
-
-        self.team1_role = team1_role
-        self.team2_role = team2_role
-        self.team1_mention = team1_mention
-        self.team2_mention = team2_mention
-        self.team1_name = team1_name
-        self.team2_name = team2_name
-        self.time_str = time_str
-        self.starts_at_utc = ensure_utc(starts_at_utc)
-
-        self.completed = False
-
-    def _build_staff_message(self, guild: discord.Guild) -> str:
-        timestamp = int(self.starts_at_utc.timestamp())
-
-        return (
-            "**Forced match-time request**\n\n"
-            f"**Team 1:** {self.team1_mention} "
-            f"({self.team1_name})\n"
-            f"**Team 2:** {self.team2_mention} "
-            f"({self.team2_name})\n"
-            f"**Scheduled time:** {self.time_str}\n"
-            f"**Discord time:** <t:{timestamp}:F>\n\n"
-            "Staff may accept or reject this proposed match time."
-        )
-
-    def _disable_buttons(self):
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.disabled = True
-
-    async def _disable_and_update(
-        self,
-        interaction: discord.Interaction,
-        message: str,
-    ):
-        self.completed = True
-        self._disable_buttons()
-
-        try:
-            if not interaction.response.is_done():
-                await interaction.response.edit_message(
-                    content=message,
-                    view=self,
-                )
-            else:
-                await interaction.edit_original_response(
-                    content=message,
-                    view=self,
-                )
-
-        except discord.NotFound:
-            logger.warning(
-                "The ForceTimeView message no longer exists."
-            )
-
-        except discord.HTTPException:
-            logger.exception(
-                "Failed to update ForceTimeView message."
-            )
-
-        finally:
-            self.stop()
-
-    @discord.ui.button(
-        label="Accept",
-        style=discord.ButtonStyle.success,
-        emoji="✅",
-    )
-    async def accept_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ):
-        if self.completed:
-            await interaction.response.send_message(
-                "This request has already been handled.",
-                ephemeral=True,
-            )
-            return
-
-        if interaction.guild is None:
-            await interaction.response.send_message(
-                "This button can only be used inside a server.",
-                ephemeral=True,
-            )
-            return
-
-        # Mark it immediately so two staff members cannot open
-        # duplicate submission modals at the same time.
-        self.completed = True
-        self._disable_buttons()
-
-        modal = SubmitTimeModal(
-            starts_at_utc=self.starts_at_utc,
-            team1_role=self.team1_role,
-            team2_role=self.team2_role,
-            team1_mention=self.team1_mention,
-            team2_mention=self.team2_mention,
-            team1_name=self.team1_name,
-            team2_name=self.team2_name,
-        )
-
-        try:
-            await interaction.response.send_modal(modal)
-
-        except Exception:
-            # Allow another attempt if Discord rejected the modal.
-            self.completed = False
-            self._enable_buttons()
-
-            logger.exception(
-                "Failed to open SubmitTimeModal from ForceTimeView."
-            )
-
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "❌ I could not open the submission form.",
-                    ephemeral=True,
-                )
-
-    @discord.ui.button(
-        label="Reject",
-        style=discord.ButtonStyle.danger,
-        emoji="❌",
-    )
-    async def reject_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ):
-        if self.completed:
-            await interaction.response.send_message(
-                "This request has already been handled.",
-                ephemeral=True,
-            )
-            return
-
-        await self._disable_and_update(
-            interaction,
-            "❌ The forced match-time request was rejected.",
-        )
-
-    def _enable_buttons(self):
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.disabled = False
-
-    async def on_timeout(self):
-        if self.completed:
-            return
-
-        self.completed = True
-        self._disable_buttons()
-        self.stop()
 
 
 def resolve_team_any(guild: discord.Guild, raw: str) -> tuple[Optional[discord.Role], str, str]:
