@@ -1073,16 +1073,15 @@ class AdminPanelView(discord.ui.View):
     def __init__(
         self,
         *,
-        starts_at_utc: datetime,
-        team1_role: discord.Role,
-        team2_role: discord.Role,
-        team1_mention: str,
-        team2_mention: str,
-        team1_name: str,
-        team2_name: str,
-        timeout: float = 900,
+        starts_at_utc: datetime | None = None,
+        team1_role: discord.Role | None = None,
+        team2_role: discord.Role | None = None,
+        team1_mention: str | None = None,
+        team2_mention: str | None = None,
+        team1_name: str | None = None,
+        team2_name: str | None = None,
     ):
-        super().__init__(timeout=timeout)
+        super().__init__(timeout=900)
 
         self.starts_at_utc = starts_at_utc
         self.team1_role = team1_role
@@ -1095,107 +1094,24 @@ class AdminPanelView(discord.ui.View):
     @discord.ui.button(
         label="submit time",
         style=discord.ButtonStyle.secondary,
+        custom_id="admin_submit_time",
     )
     async def submit_time(
         self,
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ):
-        modal = SubmitTimeModal(
-            starts_at_utc=self.starts_at_utc,
-            team1_role=self.team1_role,
-            team2_role=self.team2_role,
-            team1_mention=self.team1_mention,
-            team2_mention=self.team2_mention,
-            team1_name=self.team1_name,
-            team2_name=self.team2_name,
-        )
-
-        await interaction.response.send_modal(modal)
-
-
-class AdminPanel(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
-
-    @app_commands.guilds(Object(id=TEST_GUILD_ID))
-    @app_commands.default_permissions(administrator=True)
-    @app_commands.command(name="admin-panel", description="Open the admin panel.")
-    async def admin_panel(self, interaction: discord.Interaction):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("You do not have permission.", ephemeral=True)
-            return
-        await interaction.response.send_message("Admin Panel:", view=AdminPanelView(), ephemeral=True)
-
-    @commands.Cog.listener()
-    async def on_message(self, message: discord.Message):
-        if not message.author.bot:
-            return
-        if message.channel.id != TRANSACTIONS_CHANNEL_ID:
-            return
-        content = message.content.strip()
-        if not content.lower().startswith("/create-team"):
-            return
-        guild = message.guild
-        if guild is None:
-            return
-        parts = content.split()
-        if len(parts) < 4:
-            return
-        raw_color = parts[-1]
-        raw_capt = parts[-2]
-        name = " ".join(parts[1:-2])
-        if raw_capt.startswith("<@") and raw_capt.endswith(">"):
-            raw_capt = raw_capt.strip("<@!>")
-        try:
-            capt = await guild.fetch_member(int(raw_capt))
-        except Exception:
-            capt = None
-        if capt is None:
-            return
-        c = raw_color
-        if not c.startswith("#"):
-            c = "#" + c
-        try:
-            color_int = int(c[1:], 16)
-        except Exception:
-            return
-        try:
-            role = await guild.create_role(
-                name=name,
-                colour=discord.Colour(color_int),
-                reason="Team created by apply-bot command"
+        await interaction.response.send_modal(
+            SubmitTimeModal(
+                starts_at_utc=self.starts_at_utc,
+                team1_role=self.team1_role,
+                team2_role=self.team2_role,
+                team1_mention=self.team1_mention,
+                team2_mention=self.team2_mention,
+                team1_name=self.team1_name,
+                team2_name=self.team2_name,
             )
-        except Exception as e:
-            print(f"[AdminPanel] Failed to create team role via /create-team: {e}")
-            return
-
-        # move team role under Team Player role in the role list
-        try:
-            team_player_role = guild.get_role(TEAM_PLAYER_ROLE_ID)
-            if team_player_role:
-                target_pos = max(team_player_role.position - 1, 1)
-                await role.edit(position=target_pos)
-        except Exception as e:
-            print(f"[AdminPanel] Failed to move role {role} under Team Player: {e}")
-
-        # register team in teams.json
-        add_team_to_list(role.id, role.name)
-
-        roles = [role]
-        cap_role = guild.get_role(CAPTAIN_ROLE_ID)
-        if cap_role:
-            roles.append(cap_role)
-        try:
-            await capt.add_roles(*roles, reason="New team created via /create-team")
-        except Exception as e:
-            print(f"[AdminPanel] Failed to assign roles to captain via /create-team: {e}")
-        tx = guild.get_channel(TRANSACTIONS_CHANNEL_ID)
-        if tx:
-            try:
-                await tx.send(f"# New Team Created!\n* Team Name: {role.mention}\n* Team Captain: {capt.mention}")
-            except Exception:
-                pass
+        )
 
 
 
@@ -3524,9 +3440,11 @@ class TimeAcceptModal(discord.ui.Modal, title="Accept Match Time"):
 
 # ---------------- UPDATED ForceTimeView ----------------
 
-
-def ensure_utc(value: datetime) -> datetime:
+def ensure_utc(value: datetime | None) -> datetime:
     """Return a timezone-aware UTC datetime."""
+    if value is None:
+        raise ValueError("Match start time was not provided.")
+
     if value.tzinfo is None:
         # Treat naive datetimes as UTC.
         value = value.replace(tzinfo=timezone.utc)
@@ -3548,7 +3466,7 @@ class SubmitTimeModal(discord.ui.Modal, title="Submit Match Time"):
     ):
         super().__init__()
 
-        self.starts_at_utc = starts_at_utc.astimezone(timezone.utc)
+        self.starts_at_utc = ensure_utc(starts_at_utc)
         self.team1_role = team1_role
         self.team2_role = team2_role
         self.team1_mention = team1_mention
@@ -3556,16 +3474,23 @@ class SubmitTimeModal(discord.ui.Modal, title="Submit Match Time"):
         self.team1_name = team1_name
         self.team2_name = team2_name
 
-        self.time_input = discord.ui.TextInput(
-            label="Match time",
-            placeholder="Example: 20:30 UTC",
+        self.confirmation = discord.ui.TextInput(
+            label="Type CONFIRM to create the assignment",
+            placeholder="CONFIRM",
             required=True,
-            max_length=50,
+            max_length=10,
         )
 
-        self.add_item(self.time_input)
+        self.add_item(self.confirmation)
 
     async def on_submit(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "This action can only be used inside a server.",
+                ephemeral=True,
+            )
+            return
+
         if self.confirmation.value.strip().upper() != "CONFIRM":
             await interaction.response.send_message(
                 "Please type `CONFIRM` exactly to create the assignment.",
@@ -3574,10 +3499,6 @@ class SubmitTimeModal(discord.ui.Modal, title="Submit Match Time"):
             return
 
         try:
-            starts_at_utc = ensure_utc(self.starts_at_utc)
-
-            # Change only this function call if your existing function has
-            # a different parameter order or different parameter names.
             await post_single_assignment_message(
                 guild=interaction.guild,
                 team1_role=self.team1_role,
@@ -3586,25 +3507,29 @@ class SubmitTimeModal(discord.ui.Modal, title="Submit Match Time"):
                 team2_mention=self.team2_mention,
                 team1_name=self.team1_name,
                 team2_name=self.team2_name,
-                starts_at_utc=starts_at_utc,
+                starts_at_utc=self.starts_at_utc,
             )
 
             await interaction.response.send_message(
-                "The assignment was created successfully.",
+                "✅ The assignment was created successfully.",
                 ephemeral=True,
             )
 
         except Exception:
-            logger.exception("Failed to create assignment from SubmitTimeModal")
+            logger.exception(
+                "Failed to create assignment from SubmitTimeModal"
+            )
 
             if not interaction.response.is_done():
                 await interaction.response.send_message(
-                    "I could not create the assignment. Check the bot logs.",
+                    "❌ I could not create the assignment. "
+                    "Check the bot logs.",
                     ephemeral=True,
                 )
             else:
                 await interaction.followup.send(
-                    "I could not create the assignment. Check the bot logs.",
+                    "❌ I could not create the assignment. "
+                    "Check the bot logs.",
                     ephemeral=True,
                 )
 
@@ -3641,36 +3566,52 @@ class ForceTimeView(discord.ui.View):
 
         return (
             "**Forced match-time request**\n\n"
-            f"**Team 1:** {self.team1_mention} ({self.team1_name})\n"
-            f"**Team 2:** {self.team2_mention} ({self.team2_name})\n"
+            f"**Team 1:** {self.team1_mention} "
+            f"({self.team1_name})\n"
+            f"**Team 2:** {self.team2_mention} "
+            f"({self.team2_name})\n"
             f"**Scheduled time:** {self.time_str}\n"
             f"**Discord time:** <t:{timestamp}:F>\n\n"
             "Staff may accept or reject this proposed match time."
         )
+
+    def _disable_buttons(self):
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
 
     async def _disable_and_update(
         self,
         interaction: discord.Interaction,
         message: str,
     ):
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.disabled = True
-
         self.completed = True
+        self._disable_buttons()
 
         try:
-            await interaction.response.edit_message(
-                content=message,
-                view=self,
-            )
-        except discord.InteractionResponded:
-            await interaction.edit_original_response(
-                content=message,
-                view=self,
+            if not interaction.response.is_done():
+                await interaction.response.edit_message(
+                    content=message,
+                    view=self,
+                )
+            else:
+                await interaction.edit_original_response(
+                    content=message,
+                    view=self,
+                )
+
+        except discord.NotFound:
+            logger.warning(
+                "The ForceTimeView message no longer exists."
             )
 
-        self.stop()
+        except discord.HTTPException:
+            logger.exception(
+                "Failed to update ForceTimeView message."
+            )
+
+        finally:
+            self.stop()
 
     @discord.ui.button(
         label="Accept",
@@ -3696,7 +3637,11 @@ class ForceTimeView(discord.ui.View):
             )
             return
 
-        # Do not pass guild= here unless your modal explicitly accepts it.
+        # Mark it immediately so two staff members cannot open
+        # duplicate submission modals at the same time.
+        self.completed = True
+        self._disable_buttons()
+
         modal = SubmitTimeModal(
             starts_at_utc=self.starts_at_utc,
             team1_role=self.team1_role,
@@ -3707,7 +3652,23 @@ class ForceTimeView(discord.ui.View):
             team2_name=self.team2_name,
         )
 
-        await interaction.response.send_modal(modal)
+        try:
+            await interaction.response.send_modal(modal)
+
+        except Exception:
+            # Allow another attempt if Discord rejected the modal.
+            self.completed = False
+            self._enable_buttons()
+
+            logger.exception(
+                "Failed to open SubmitTimeModal from ForceTimeView."
+            )
+
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "❌ I could not open the submission form.",
+                    ephemeral=True,
+                )
 
     @discord.ui.button(
         label="Reject",
@@ -3731,15 +3692,18 @@ class ForceTimeView(discord.ui.View):
             "❌ The forced match-time request was rejected.",
         )
 
+    def _enable_buttons(self):
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = False
+
     async def on_timeout(self):
         if self.completed:
             return
 
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.disabled = True
-
         self.completed = True
+        self._disable_buttons()
+        self.stop()
 
 
 def resolve_team_any(guild: discord.Guild, raw: str) -> tuple[Optional[discord.Role], str, str]:
