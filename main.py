@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import asyncio
 import json
 import os
@@ -23,6 +24,7 @@ MATCHES: dict[str, MatchAssignment] = {}
 MATCHES: dict[str, "MatchAssignment"] = {}
 from typing import Literal
 RoleType = Literal["tank", "healer", "dps"]
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -3652,15 +3654,6 @@ class TimeAcceptModal(discord.ui.Modal, title="Accept Match Time"):
         )
 
 # ---------------- UPDATED ForceTimeView ----------------
-from __future__ import annotations
-
-import logging
-from datetime import datetime, timezone
-from typing import Optional
-
-import discord
-
-logger = logging.getLogger(__name__)
 
 
 def ensure_utc(value: datetime) -> datetime:
