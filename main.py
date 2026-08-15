@@ -3474,7 +3474,7 @@ def parse_match_time(value: str) -> datetime:
 # Submit time modal
 # -----------------------------
 
-class SubmitTimeModal(discord.ui.Modal, title="Set Match Time"):
+class SubmitTimeModal(discord.ui.Modal, title="Submit Match Details"):
     week = discord.ui.TextInput(
         label="Week",
         placeholder="Example: Week 3",
@@ -3486,49 +3486,31 @@ class SubmitTimeModal(discord.ui.Modal, title="Set Match Time"):
         label="Time",
         placeholder="Example: 2026-08-22 20:00 UTC",
         required=True,
-        max_length=40,
+        max_length=50,
     )
 
-    team1_name = discord.ui.TextInput(
+    team1_name_input = discord.ui.TextInput(
         label="Team 1 name",
-        placeholder="Enter Team 1",
         required=True,
         max_length=100,
     )
 
-    team2_name = discord.ui.TextInput(
+    team2_name_input = discord.ui.TextInput(
         label="Team 2 name",
-        placeholder="Enter Team 2",
         required=True,
         max_length=100,
     )
 
-    def __init__(self, parent_view):
+    def __init__(
+        self,
+        *,
+        parent_view: "ForceTimeView",
+        original_message: discord.Message | None = None,
+    ):
         super().__init__()
+
         self.parent_view = parent_view
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            starts_at_utc = parse_match_time(self.match_time.value)
-
-            self.parent_view.week = self.week.value.strip()
-            self.parent_view.time_str = self.match_time.value.strip()
-            self.parent_view.starts_at_utc = starts_at_utc
-            self.parent_view.team1_name = self.team1_name.value.strip()
-            self.parent_view.team2_name = self.team2_name.value.strip()
-
-            await interaction.response.send_message(
-                "Match information saved.",
-                ephemeral=True,
-            )
-
-        except Exception:
-            logger.exception("Failed to process match-time form")
-            await interaction.response.send_message(
-                "The time format is invalid. Use: YYYY-MM-DD HH:MM UTC",
-                ephemeral=True,
-            )
-
+        self.original_message = original_message
 
 # -----------------------------
 # Admin panel view
