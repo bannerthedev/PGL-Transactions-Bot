@@ -3474,112 +3474,64 @@ def parse_match_time(value: str) -> datetime:
 # Submit time modal
 # -----------------------------
 
-class SubmitTimeModal(discord.ui.Modal, title="Submit Match Time"):
-    match_time = discord.ui.TextInput(
-        label="Match time",
-        placeholder="2026-08-20 20:00 UTC",
-        default="",
+class SubmitTimeModal(discord.ui.Modal, title="Schedule Match"):
+    week = discord.ui.TextInput(
+        label="Week",
+        placeholder="Example: Week 3",
         required=True,
-        max_length=64,
-        style=discord.TextStyle.short,
+        max_length=30,
     )
 
-    def __init__(
-        self,
-        *,
-        team1_role: Optional[discord.Role] = None,
-        team2_role: Optional[discord.Role] = None,
-        team1_name: Optional[str] = None,
-        team2_name: Optional[str] = None,
-        team1_mention: Optional[str] = None,
-        team2_mention: Optional[str] = None,
-        starts_at_utc: Optional[datetime] = None,
-        original_message: Optional[discord.Message] = None,
-    ):
+    match_time = discord.ui.TextInput(
+        label="Time",
+        placeholder="Example: 2026-08-22 20:00 UTC",
+        required=True,
+        max_length=40,
+    )
+
+    team1_name = discord.ui.TextInput(
+        label="Team 1 name",
+        placeholder="Enter Team 1's name",
+        required=True,
+        max_length=100,
+    )
+
+    team2_name = discord.ui.TextInput(
+        label="Team 2 name",
+        placeholder="Enter Team 2's name",
+        required=True,
+        max_length=100,
+    )
+
+    def __init__(self, parent_view):
         super().__init__()
+        self.parent_view = parent_view
 
-        self.team1_role = team1_role
-        self.team2_role = team2_role
-        self.team1_name = team1_name or (
-            team1_role.name if team1_role else "Team 1"
-        )
-        self.team2_name = team2_name or (
-            team2_role.name if team2_role else "Team 2"
-        )
-        self.team1_mention = team1_mention or (
-            team1_role.mention if team1_role else self.team1_name
-        )
-        self.team2_mention = team2_mention or (
-            team2_role.mention if team2_role else self.team2_name
-        )
-        self.starts_at_utc = (
-            ensure_utc(starts_at_utc)
-            if starts_at_utc is not None
-            else None
-        )
-        self.original_message = original_message
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
+    async def on_submit(self, interaction: discord.Interaction):
         try:
-            # Always parse the value typed into the form.
-            starts_at_utc = parse_match_time(str(self.match_time))
+            starts_at_utc = datetime.strptime(
+                self.match_time.value.strip(),
+                "%Y-%m-%d %H:%M UTC",
+            ).replace(tzinfo=timezone.utc)
 
-            if starts_at_utc <= datetime.now(timezone.utc):
-                await interaction.response.send_message(
-                    "The match time must be in the future.",
-                    ephemeral=True,
-                )
-                return
-
-            self.starts_at_utc = starts_at_utc
-
-            time_display = discord.utils.format_dt(
-                starts_at_utc,
-                style="F",
-            )
-
-            # Replace this section with your scheduling function if needed.
-            await post_single_assignment_message(
-                interaction=interaction,
-                team1_role=self.team1_role,
-                team2_role=self.team2_role,
-                team1_name=self.team1_name,
-                team2_name=self.team2_name,
-                team1_mention=self.team1_mention,
-                team2_mention=self.team2_mention,
-                time_str=time_display,
-                starts_at_utc=starts_at_utc,
-            )
-
+        except ValueError:
             await interaction.response.send_message(
-                f"Match time submitted for {time_display}.",
+                "Invalid time format. Use: `YYYY-MM-DD HH:MM UTC`",
                 ephemeral=True,
             )
+            return
 
-            # Disable the originating panel after successful submission.
-            if self.original_message is not None:
-                try:
-                    await self.original_message.edit(view=None)
-                except discord.HTTPException:
-                    logger.exception(
-                        "Could not remove the admin panel view."
-                    )
+        # Save the submitted values to the parent view
+        self.parent_view.week = self.week.value.strip()
+        self.parent_view.starts_at_utc = starts_at_utc
+        self.parent_view.time_str = self.match_time.value.strip()
+        self.parent_view.team1_name = self.team1_name.value.strip()
+        self.parent_view.team2_name = self.team2_name.value.strip()
 
-        except ValueError as exc:
-            await interaction.response.send_message(
-                str(exc),
-                ephemeral=True,
-            )
-
-        except Exception:
-            logger.exception("Error submitting match time")
-
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "An unexpected error occurred while submitting the "
-                    "match time.",
-                    ephemeral=True,
-                )
+        await interaction.response.send_message(
+            "Match details saved successfully.",
+            ephemeral=True,
+        )
 
 
 # -----------------------------
