@@ -3440,33 +3440,74 @@ class TimeAcceptModal(discord.ui.Modal, title="Accept Match Time"):
 
 # ---------------- UPDATED ForceTimeView ----------------
 
+from datetime import datetime, timezone
+import re
+
+
 def ensure_utc(value: datetime | None) -> datetime:
-    """Return a timezone-aware UTC datetime."""
     if value is None:
         raise ValueError("Match start time was not provided.")
 
     if value.tzinfo is None:
-        # Treat naive datetimes as UTC.
         value = value.replace(tzinfo=timezone.utc)
 
     return value.astimezone(timezone.utc)
+
+
+def parse_match_time(value: str) -> datetime:
+    """
+    Accepts formats such as:
+
+        2026-08-20 20:00 UTC
+        2026-08-20 20:00
+        08/20/2026 8:00 PM
+        2026-08-20T20:00:00+00:00
+    """
+
+    text = value.strip()
+
+    formats = (
+        "%Y-%m-%d %H:%M UTC",
+        "%Y-%m-%d %H:%M",
+        "%m/%d/%Y %I:%M %p",
+        "%m/%d/%Y %H:%M",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M%z",
+    )
+
+    for date_format in formats:
+        try:
+            parsed = datetime.strptime(text, date_format)
+
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+
+            return parsed.astimezone(timezone.utc)
+
+        except ValueError:
+            continue
+
+    raise ValueError(
+        "Invalid time format. Use for example: "
+        "`2026-08-20 20:00 UTC` or `08/20/2026 8:00 PM`."
+    )
 
 
 class SubmitTimeModal(discord.ui.Modal, title="Submit Match Time"):
     def __init__(
         self,
         *,
-        starts_at_utc: datetime,
-        team1_role: discord.Role,
-        team2_role: discord.Role,
-        team1_mention: str,
-        team2_mention: str,
-        team1_name: str,
-        team2_name: str,
+        starts_at_utc: datetime | None = None,
+        team1_role: discord.Role | None = None,
+        team2_role: discord.Role | None = None,
+        team1_mention: str | None = None,
+        team2_mention: str | None = None,
+        team1_name: str | None = None,
+        team2_name: str | None = None,
     ):
         super().__init__()
 
-        self.starts_at_utc = ensure_utc(starts_at_utc)
+        self.starts_at_utc = starts_at_utc
         self.team1_role = team1_role
         self.team2_role = team2_role
         self.team1_mention = team1_mention
@@ -3474,31 +3515,28 @@ class SubmitTimeModal(discord.ui.Modal, title="Submit Match Time"):
         self.team1_name = team1_name
         self.team2_name = team2_name
 
-        self.confirmation = discord.ui.TextInput(
-            label="Type CONFIRM to create the assignment",
-            placeholder="CONFIRM",
+        self.time_input = discord.ui.TextInput(
+            label="Match time",
+            placeholder="2026-08-20 20:00 UTC",
             required=True,
-            max_length=10,
+            max_length=100,
         )
 
-        self.add_item(self.confirmation)
+        self.add_item(self.time_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        if interaction.guild is None:
-            await interaction.response.send_message(
-                "This action can only be used inside a server.",
-                ephemeral=True,
-            )
-            return
-
-        if self.confirmation.value.strip().upper() != "CONFIRM":
-            await interaction.response.send_message(
-                "Please type `CONFIRM` exactly to create the assignment.",
-                ephemeral=True,
-            )
-            return
-
         try:
+            # The modal's entered value takes priority.
+            entered_time = self.time_input.value.strip()
+            starts_at_utc = parse_match_time(entered_time)
+
+            if interaction.guild is None:
+                await interaction.response.send_message(
+                    "This modal can only be used inside a server.",
+                    ephemeral=True,
+                )
+                return
+
             await post_single_assignment_message(
                 guild=interaction.guild,
                 team1_role=self.team1_role,
@@ -3507,11 +3545,17 @@ class SubmitTimeModal(discord.ui.Modal, title="Submit Match Time"):
                 team2_mention=self.team2_mention,
                 team1_name=self.team1_name,
                 team2_name=self.team2_name,
-                starts_at_utc=self.starts_at_utc,
+                starts_at_utc=starts_at_utc,
             )
 
             await interaction.response.send_message(
-                "✅ The assignment was created successfully.",
+                "The assignment was created successfully.",
+                ephemeral=True,
+            )
+
+        except ValueError as exc:
+            await interaction.response.send_message(
+                str(exc),
                 ephemeral=True,
             )
 
@@ -3522,14 +3566,12 @@ class SubmitTimeModal(discord.ui.Modal, title="Submit Match Time"):
 
             if not interaction.response.is_done():
                 await interaction.response.send_message(
-                    "❌ I could not create the assignment. "
-                    "Check the bot logs.",
+                    "I could not create the assignment. Check the bot logs.",
                     ephemeral=True,
                 )
             else:
                 await interaction.followup.send(
-                    "❌ I could not create the assignment. "
-                    "Check the bot logs.",
+                    "I could not create the assignment. Check the bot logs.",
                     ephemeral=True,
                 )
 
