@@ -21,6 +21,7 @@ from PIL import Image, ImageDraw, ImageFont
 from typing import Optional  # add List only if you truly still use List[...]
 MATCHES: dict[str, MatchAssignment] = {}
 MATCHES: dict[str, "MatchAssignment"] = {}
+RoleType = Literal["tank", "healer", "dps"]
 
 load_dotenv()
 
@@ -3492,144 +3493,162 @@ class ScrimAlertLoop(commands.Cog):
 
 # ---------------- FIXED TimeAcceptView ----------------
 
+from datetime import datetime, timezone
+import discord
+
+
 class TimeAcceptView(discord.ui.View):
     def __init__(
         self,
         *,
-        guild: discord.Guild,
-        team1_role: discord.Role,
-        team2_role: discord.Role,
+        team1_role: RoleType,
+        team2_role: RoleType,
+        team1_mention: str,
+        team2_mention: str,
         team1_name: str,
         team2_name: str,
-        starts_at_utc: datetime,
         time_str: str,
-        timeout: Optional[float] = None,
+        starts_at_utc: datetime,
+        timeout: float | None = 3600,
     ):
         super().__init__(timeout=timeout)
 
-        self.guild = guild
         self.team1_role = team1_role
         self.team2_role = team2_role
+        self.team1_mention = team1_mention
+        self.team2_mention = team2_mention
         self.team1_name = team1_name
         self.team2_name = team2_name
-        self.starts_at_utc = starts_at_utc
         self.time_str = time_str
-        self.resolved = False
+        self.starts_at_utc = starts_at_utc
 
-    async def interaction_check(
+    @discord.ui.button(
+        label="Accept Time",
+        style=discord.ButtonStyle.success,
+        custom_id="time_accept",
+    )
+    async def accept_time(
         self,
         interaction: discord.Interaction,
-    ) -> bool:
-        """
-        Only members with either participating team role may use the buttons.
-        """
-
-        if not isinstance(interaction.user, discord.Member):
+        button: discord.ui.Button,
+    ):
+        if interaction.guild is None:
             await interaction.response.send_message(
-                "You cannot use this button.",
-                ephemeral=True,
-            )
-            return False
-
-        member = interaction.user
-
-        has_team_role = (
-            self.team1_role in member.roles
-            or self.team2_role in member.roles
-        )
-
-        if not has_team_role:
-            await interaction.response.send_message(
-                "Only members of one of the participating teams can respond.",
-                ephemeral=True,
-            )
-            return False
-
-        return True
-
-    def _disable_buttons(self) -> None:
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.disabled = True
-
-    async def _finish(
-        self,
-        interaction: discord.Interaction,
-        *,
-        accepted: bool,
-    ) -> None:
-        if self.resolved:
-            await interaction.response.send_message(
-                "This match time has already been resolved.",
+                "This button can only be used inside a server.",
                 ephemeral=True,
             )
             return
 
-        self.resolved = True
-        self._disable_buttons()
+        # Disable the buttons after acceptance
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
 
-        user = interaction.user
-        user_name = getattr(user, "display_name", str(user))
+        # Create the assignment using your existing function
+        try:
+            await post_single_assignment_message(
+                guild=interaction.guild,
+                team1_role=self.team1_role,
+                team2_role=self.team2_role,
+                team1_mention=self.team1_mention,
+                team2_mention=self.team2_mention,
+                team1_name=self.team1_name,
+                team2_name=self.team2_name,
+                time_str=self.time_str,
+                starts_at_utc=self.starts_at_utc,
+            )
+        except Exception as exc:
+            print(f"Failed to create assignment: {exc}")
 
-        if accepted:
-            result_text = (
-                f"✅ **Match time accepted**\n"
-                f"**{self.team1_name}** vs **{self.team2_name}**\n"
-                f"Time: **{self.time_str}**\n"
-                f"Accepted by: {user_name}"
+            await interaction.response.send_message(
+                "The time was accepted, but the assignment could not be created.",
+                ephemeral=True,
             )
-        else:
-            result_text = (
-                f"❌ **Match time declined**\n"
-                f"**{self.team1_name}** vs **{self.team2_name}**\n"
-                f"Time: **{self.time_str}**\n"
-                f"Declined by: {user_name}"
-            )
+            return
 
         await interaction.response.edit_message(
-            content=result_text,
+            content=(
+                f"✅ Match time accepted: **{self.time_str}**\n\n"
+                f"{self.team1_mention} vs {self.team2_mention}"
+            ),
             view=self,
         )
 
-        # Put your existing follow-up logic here.
-        if accepted:
-            # Example:
-            #
-            # await post_single_assignment_message(
-            #     guild=self.guild,
-            #     team1_role=self.team1_role,
-            #     team2_role=self.team2_role,
-            #     team1_name=self.team1_name,
-            #     team2_name=self.team2_name,
-            #     starts_at_utc=self.starts_at_utc,
-            #     time_str=self.time_str,
-            # )
-            pass
-
     @discord.ui.button(
-        label="Accept time",
-        style=discord.ButtonStyle.success,
-        emoji="✅",
-    )
-    async def accept_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        await self._finish(interaction, accepted=True)
-
-    @discord.ui.button(
-        label="Decline time",
+        label="Reject Time",
         style=discord.ButtonStyle.danger,
-        emoji="❌",
+        custom_id="time_reject",
     )
-    async def decline_button(
+    async def reject_time(
         self,
         interaction: discord.Interaction,
         button: discord.ui.Button,
-    ) -> None:
-        await self._finish(interaction, accepted=False)
+    ):
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
 
+        await interaction.response.edit_message(
+            content="❌ Match time rejected.",
+            view=self,
+        )
+
+
+class TimeAcceptModal(discord.ui.Modal, title="Accept Match Time"):
+    confirmed_time = discord.ui.TextInput(
+        label="Confirm or change the time",
+        placeholder="Example: Friday at 8:00 PM UTC",
+        required=True,
+        max_length=100,
+    )
+
+    def __init__(
+        self,
+        *,
+        team1_role: RoleType,
+        team2_role: RoleType,
+        team1_mention: str,
+        team2_mention: str,
+        team1_name: str,
+        team2_name: str,
+        time_str: str,
+        starts_at_utc: datetime,
+    ):
+        super().__init__()
+
+        self.team1_role = team1_role
+        self.team2_role = team2_role
+        self.team1_mention = team1_mention
+        self.team2_mention = team2_mention
+        self.team1_name = team1_name
+        self.team2_name = team2_name
+        self.time_str = time_str
+        self.starts_at_utc = starts_at_utc
+
+        self.confirmed_time.default = time_str
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # Do not pass guild=... here.
+        # TimeAcceptView obtains the guild from interaction.guild.
+        view = TimeAcceptView(
+            team1_role=self.team1_role,
+            team2_role=self.team2_role,
+            team1_mention=self.team1_mention,
+            team2_mention=self.team2_mention,
+            team1_name=self.team1_name,
+            team2_name=self.team2_name,
+            time_str=str(self.confirmed_time.value),
+            starts_at_utc=self.starts_at_utc,
+        )
+
+        await interaction.response.send_message(
+            (
+                f"Proposed match time: **{self.confirmed_time.value}**\n"
+                f"{self.team1_mention} vs {self.team2_mention}\n\n"
+                "Accept this time?"
+            ),
+            view=view,
+        )
 
 # ---------------- UPDATED ForceTimeView ----------------
 class ForceTimeView(discord.ui.View):
@@ -3924,10 +3943,12 @@ class SubmitTimeModal(discord.ui.Modal, title="Submit Match Time"):
         view = TimeAcceptView(
             team1_role=team1_role,
             team2_role=team2_role,
+            team1_mention=team1_mention,
+            team2_mention=team2_mention,
             team1_name=team1_name,
             team2_name=team2_name,
-            week=self.week.value,
             time=self.time.value,
+            starts_at_utc=self.starts_at_utc,
         )
 
         try:
