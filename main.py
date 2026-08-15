@@ -18,9 +18,10 @@ from discord import Object, app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
-from typing import Any, Optional, Literal
+from typing import Optional  # add List only if you truly still use List[...]
 MATCHES: dict[str, MatchAssignment] = {}
 MATCHES: dict[str, "MatchAssignment"] = {}
+from typing import Literal
 RoleType = Literal["tank", "healer", "dps"]
 
 load_dotenv()
@@ -3651,19 +3652,117 @@ class TimeAcceptModal(discord.ui.Modal, title="Accept Match Time"):
         )
 
 # ---------------- UPDATED ForceTimeView ----------------
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+from typing import Optional
+
+import discord
+
+logger = logging.getLogger(__name__)
+
+
+def ensure_utc(value: datetime) -> datetime:
+    """Return a timezone-aware UTC datetime."""
+    if value.tzinfo is None:
+        # Treat naive datetimes as UTC.
+        value = value.replace(tzinfo=timezone.utc)
+
+    return value.astimezone(timezone.utc)
+
+
+class SubmitTimeModal(discord.ui.Modal, title="Confirm Match Time"):
+    def __init__(
+        self,
+        *,
+        starts_at_utc: datetime,
+        team1_role: discord.Role,
+        team2_role: discord.Role,
+        team1_mention: str,
+        team2_mention: str,
+        team1_name: str,
+        team2_name: str,
+    ):
+        super().__init__()
+
+        self.starts_at_utc = ensure_utc(starts_at_utc)
+        self.team1_role = team1_role
+        self.team2_role = team2_role
+        self.team1_mention = team1_mention
+        self.team2_mention = team2_mention
+        self.team1_name = team1_name
+        self.team2_name = team2_name
+
+        self.confirmation = discord.ui.TextInput(
+            label="Confirmation",
+            placeholder="Type CONFIRM to create this assignment",
+            required=True,
+            max_length=20,
+        )
+
+        self.add_item(self.confirmation)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if self.confirmation.value.strip().upper() != "CONFIRM":
+            await interaction.response.send_message(
+                "Please type `CONFIRM` exactly to create the assignment.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            starts_at_utc = ensure_utc(self.starts_at_utc)
+
+            # Change only this function call if your existing function has
+            # a different parameter order or different parameter names.
+            await post_single_assignment_message(
+                guild=interaction.guild,
+                team1_role=self.team1_role,
+                team2_role=self.team2_role,
+                team1_mention=self.team1_mention,
+                team2_mention=self.team2_mention,
+                team1_name=self.team1_name,
+                team2_name=self.team2_name,
+                starts_at_utc=starts_at_utc,
+            )
+
+            await interaction.response.send_message(
+                "The assignment was created successfully.",
+                ephemeral=True,
+            )
+
+        except Exception:
+            logger.exception("Failed to create assignment from SubmitTimeModal")
+
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "I could not create the assignment. Check the bot logs.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(
+                    "I could not create the assignment. Check the bot logs.",
+                    ephemeral=True,
+                )
+
+
 class ForceTimeView(discord.ui.View):
     def __init__(
         self,
-        team1_role: Optional[discord.Role],
-        team2_role: Optional[discord.Role],
+        *,
+        team1_role: discord.Role,
+        team2_role: discord.Role,
         team1_mention: str,
         team2_mention: str,
         team1_name: str,
         team2_name: str,
         time_str: str,
-        starts_at_utc: datetime,  # NEW (timezone-aware UTC datetime)
+        starts_at_utc: datetime,
+        timeout: Optional[float] = 3600,
     ):
-        super().__init__(timeout=None)
+        super().__init__(timeout=timeout)
+
         self.team1_role = team1_role
         self.team2_role = team2_role
         self.team1_mention = team1_mention
@@ -3671,292 +3770,114 @@ class ForceTimeView(discord.ui.View):
         self.team1_name = team1_name
         self.team2_name = team2_name
         self.time_str = time_str
-        self.starts_at_utc = self._ensure_utc(starts_at_utc)
+        self.starts_at_utc = ensure_utc(starts_at_utc)
 
-    def _ensure_utc(self, dt: datetime) -> datetime:
-        if dt.tzinfo is None:
-            return dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-
-    def _build_forced_message(self) -> str:
-        return f"{self.team1_mention} {self.team2_mention} Your day to play is: {self.time_str}"
+        self.completed = False
 
     def _build_staff_message(self, guild: discord.Guild) -> str:
-        # Use whichever staff ping builder you prefer.
-        # If you don't have build_staff_ping_header, replace it with your old staff_mentions logic.
-        try:
-            staff_header = build_staff_ping_header(guild)
-        except Exception:
-            staff_header = ""
+        timestamp = int(self.starts_at_utc.timestamp())
 
         return (
-            f"{staff_header}\n"
-            f"I have picked this time for {self.team1_mention} and {self.team2_mention}: **{self.time_str}**\n\n"
-            f"If you want me to post the message click on the **Accept** button,\n"
-            f"but if you want me to find a new time click the **Deny** button."
+            "**Forced match-time request**\n\n"
+            f"**Team 1:** {self.team1_mention} ({self.team1_name})\n"
+            f"**Team 2:** {self.team2_mention} ({self.team2_name})\n"
+            f"**Scheduled time:** {self.time_str}\n"
+            f"**Discord time:** <t:{timestamp}:F>\n\n"
+            "Staff may accept or reject this proposed match time."
         )
 
-    def _find_scheduling_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
-        t1 = (self.team1_name or "").lower()
-        t2 = (self.team2_name or "").lower()
-
-        def norm(s: str) -> str:
-            return re.sub(r"[^a-z0-9]", "", (s or "").lower())
-
-        n_t1 = norm(t1)
-        n_t2 = norm(t2)
-
-        for ch in guild.text_channels:
-            name = ch.name or ""
-            topic = ch.topic or ""
-            if "-vs-" not in name.lower():
-                continue
-            combined = name + " " + topic
-            n_combined = norm(combined)
-            if n_t1 in n_combined and n_t2 in n_combined:
-                return ch
-        return None
-
-    def _disable_buttons(self):
+    async def _disable_and_update(
+        self,
+        interaction: discord.Interaction,
+        message: str,
+    ):
         for child in self.children:
             if isinstance(child, discord.ui.Button):
                 child.disabled = True
 
-    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success)
-    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild = interaction.guild
-        if guild is None:
-            await interaction.response.send_message("Use this in a server.", ephemeral=True)
-            return
+        self.completed = True
 
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("Only admins can accept.", ephemeral=True)
-            return
-
-        # 1) Find scheduling channel
-        sched_ch = self._find_scheduling_channel(guild)
-        if not isinstance(sched_ch, discord.TextChannel):
-            await interaction.response.send_message(
-                "Could not find a scheduling channel for these teams.",
-                ephemeral=True,
-            )
-            return
-
-        # 2) Post forced time message into scheduling channel
         try:
-            await sched_ch.send(self._build_forced_message())
-        except Exception:
-            await interaction.response.send_message("Failed to send forced time message.", ephemeral=True)
-            return
-
-        week = "Forced"
-        time_str = self.time_str
-        starts_at_utc = self._ensure_utc(self.starts_at_utc)
-
-        # 3) MATCH_TIMES entry
-        match_times = guild.get_channel(MATCH_TIMES_CHANNEL_ID)
-        if isinstance(match_times, discord.TextChannel):
-            mt_content = (
-                f"{self.team1_name} vs {self.team2_name}\n"
-                f"> WEEK: {week}\n"
-                f"> Time: {time_str}\n"
-                f"> Referee: \n"
-                f"> Caster: \n"
-                f"> Commentators: "
+            await interaction.response.edit_message(
+                content=message,
+                view=self,
             )
-            try:
-                await match_times.send(mt_content)
-            except Exception:
-                pass
-
-        # 4) SINGLE consolidated assignments post (with claim buttons + alert scheduling)
-        try:
-            await post_single_assignment_message(
-                guild=guild,
-                team1_name=self.team1_name,
-                team2_name=self.team2_name,
-                week=week,
-                time_str=time_str,
-                starts_at_utc=starts_at_utc,
+        except discord.InteractionResponded:
+            await interaction.edit_original_response(
+                content=message,
+                view=self,
             )
-        except Exception:
-            await interaction.response.send_message(
-                f"Forced time posted in {sched_ch.mention}, but failed to create the assignments post.",
-                ephemeral=True,
-            )
-            return
 
-        # 5) Finish interaction + disable staff prompt buttons
-        await interaction.response.send_message(
-            f"Forced time posted in {sched_ch.mention} and assignments created.",
-            ephemeral=True,
-        )
-
-        self._disable_buttons()
-        try:
-            await interaction.message.edit(view=self)
-        except Exception:
-            pass
         self.stop()
 
-    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger)
-    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild = interaction.guild
-        if guild is None:
-            await interaction.response.send_message("Use this in a server.", ephemeral=True)
-            return
-
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("Only admins can deny.", ephemeral=True)
-            return
-
-        # Must regenerate BOTH the display string AND the datetime used for 10-min alerts
-        try:
-            new_time_str, new_starts_at_utc = generate_forced_time()
-        except Exception:
-            await interaction.response.send_message("Failed to pick a new time.", ephemeral=True)
-            return
-
-        self.time_str = new_time_str
-        self.starts_at_utc = self._ensure_utc(new_starts_at_utc)
-
-        new_content = self._build_staff_message(guild)
-        try:
-            await interaction.message.edit(content=new_content, view=self)
-        except Exception:
-            pass
-
-        await interaction.response.send_message("Picked a new time.", ephemeral=True)
-
-
-class SubmitTimeModal(discord.ui.Modal, title="Submit Match Time"):
-    week = discord.ui.TextInput(label="WEEK", required=True)
-    time = discord.ui.TextInput(label="Time", required=True)
-    team1 = discord.ui.TextInput(label="Team 1 (mention/name/id)", required=True)
-    team2 = discord.ui.TextInput(label="Team 2 (mention/name/id)", required=True)
-
-    def _resolve_team(self, guild: discord.Guild, raw: str) -> tuple[Optional[discord.Role], str, str]:
-        text = raw.strip()
-
-        # 1) Mention: <@&123>
-        if text.startswith("<@&") and text.endswith(">"):
-            try:
-                rid = int(text.strip("<@&>"))
-                r = guild.get_role(rid)
-                if r:
-                    return r, r.mention, r.name
-            except Exception:
-                pass
-
-        # 2) Raw ID: 1234567890
-        try:
-            rid = int(text)
-            r = guild.get_role(rid)
-            if r:
-                return r, r.mention, r.name
-        except Exception:
-            pass
-
-        # 3) Direct role name match (case-insensitive)
-        r = (
-            discord.utils.get(guild.roles, name=text)
-            or discord.utils.find(lambda rr: rr.name.lower() == text.lower(), guild.roles)
-        )
-        if r:
-            return r, r.mention, r.name
-
-        # 4) Fallback: look in teams.json by team "name" field
-        try:
-            teams = load_teams()  # uses your existing helper
-        except Exception:
-            teams = []
-
-        text_lower = text.lower()
-        matched_role = None
-
-        for entry in teams:
-            t_name = str(entry.get("name", "")).strip()
-            rid = entry.get("role_id")
-            if not t_name or not rid:
-                continue
-            if t_name.lower() != text_lower:   # exact case-insensitive match on team name
-                continue
-            try:
-                rid_int = int(rid)
-            except Exception:
-                continue
-            r = guild.get_role(rid_int)
-            if r:
-                matched_role = r
-                break
-
-        if matched_role:
-            return matched_role, matched_role.mention, matched_role.name
-
-        # 5) Nothing matched: return the raw text as display + name, no ping
-        return None, text, text
-
-    async def on_submit(self, interaction: discord.Interaction):
-        guild = interaction.guild
-        if guild is None:
-            await interaction.response.send_message("Use this in a server.", ephemeral=True)
-            return
-        channel = interaction.channel
-        if not isinstance(channel, discord.TextChannel):
-            await interaction.response.send_message("This modal must be used in a text channel.", ephemeral=True)
-            return
-
-        team1_role, team1_mention, team1_name = self._resolve_team(guild, self.team1.value)
-        team2_role, team2_mention, team2_name = self._resolve_team(guild, self.team2.value)
-
-        stage_raw = self.week.value.strip()
-        stage_l = stage_raw.lower()
-        if "final" in stage_l:
-            header = "# FINALS"
-            special = True
-        elif "semi" in stage_l:
-            header = "# SEMIFINALS"
-            special = True
-        else:
-            header = None
-            special = False
-
-        if special:
-            content = (
-                f"{header}\n"
-                f"> Teams: {team1_mention} vs {team2_mention}\n"
-                f"> Time: {self.time.value}\n"
-                f"> Referee: \n"
-                f"> Caster: \n"
-                f"> Commentator: "
+    @discord.ui.button(
+        label="Accept",
+        style=discord.ButtonStyle.success,
+        emoji="✅",
+    )
+    async def accept_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        if self.completed:
+            await interaction.response.send_message(
+                "This request has already been handled.",
+                ephemeral=True,
             )
-        else:
-            content = (
-                f"{team1_mention} vs {team2_mention}\n"
-                f"Team staff must accept this match.\n"
-                f"> WEEK: {self.week.value}\n"
-                f"> Time: {self.time.value}\n"
-                f"> Team 1: \n"
-                f"> Team 2: "
-            )
+            return
 
-        view = TimeAcceptView(
-            team1_role=team1_role,
-            team2_role=team2_role,
-            team1_mention=team1_mention,
-            team2_mention=team2_mention,
-            team1_name=team1_name,
-            team2_name=team2_name,
-            time=self.time.value,
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "This button can only be used inside a server.",
+                ephemeral=True,
+            )
+            return
+
+        # Do not pass guild= here unless your modal explicitly accepts it.
+        modal = SubmitTimeModal(
             starts_at_utc=self.starts_at_utc,
+            team1_role=self.team1_role,
+            team2_role=self.team2_role,
+            team1_mention=self.team1_mention,
+            team2_mention=self.team2_mention,
+            team1_name=self.team1_name,
+            team2_name=self.team2_name,
         )
 
-        try:
-            sent = await channel.send(content, view=view)
-            view.origin_message = sent
-            await interaction.response.send_message("Match time request posted.", ephemeral=True)
-        except Exception:
-            await interaction.response.send_message("Failed to post match time (missing perms?).", ephemeral=True)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(
+        label="Reject",
+        style=discord.ButtonStyle.danger,
+        emoji="❌",
+    )
+    async def reject_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        if self.completed:
+            await interaction.response.send_message(
+                "This request has already been handled.",
+                ephemeral=True,
+            )
+            return
+
+        await self._disable_and_update(
+            interaction,
+            "❌ The forced match-time request was rejected.",
+        )
+
+    async def on_timeout(self):
+        if self.completed:
+            return
+
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+
+        self.completed = True
 
 
 def resolve_team_any(guild: discord.Guild, raw: str) -> tuple[Optional[discord.Role], str, str]:
@@ -4154,111 +4075,187 @@ class SaySomethingCog(commands.Cog):
 
 
 # ---------------- ForceTimeAutoWarnCog ----------------
+
+def generate_forced_time() -> tuple[str, datetime]:
+    """
+    Generate a random forced match time.
+
+    Returns:
+        tuple[str, datetime]:
+            - Human-readable time string
+            - Timezone-aware UTC datetime
+    """
+
+    now_utc = datetime.now(timezone.utc)
+
+    # Choose a date 1–5 days from now.
+    match_date = (now_utc + timedelta(days=random.randint(1, 5))).date()
+
+    # Allowed times: 18:00 through 22:00 UTC, every 30 minutes.
+    minute_offset = random.randint(0, 8) * 30
+    hour = 18 + (minute_offset // 60)
+    minute = minute_offset % 60
+
+    starts_at_utc = datetime(
+        year=match_date.year,
+        month=match_date.month,
+        day=match_date.day,
+        hour=hour,
+        minute=minute,
+        tzinfo=timezone.utc,
+    )
+
+    # Prevent accidentally generating a time in the past.
+    if starts_at_utc <= now_utc:
+        starts_at_utc += timedelta(days=1)
+
+    time_str = starts_at_utc.strftime(
+        "%A, %B %d at %I:%M %p UTC"
+    )
+
+    return time_str, starts_at_utc
+
+
 class ForceTimeAutoWarnCog(commands.Cog):
-    def __init__(self, bot: commands.Bot):
+    """
+    Sends automatic warnings before a forced match begins.
+
+    Usage:
+
+        auto_warn_cog = ForceTimeAutoWarnCog(
+            bot,
+            warning_channel_id=123456789012345678,
+        )
+        await bot.add_cog(auto_warn_cog)
+
+    Then, after creating a forced match:
+
+        cog = bot.get_cog("ForceTimeAutoWarnCog")
+
+        if cog:
+            cog.schedule_warning(
+                guild_id=guild.id,
+                starts_at_utc=starts_at_utc,
+                team1_mention=t1_mention,
+                team2_mention=t2_mention,
+            )
+    """
+
+    def __init__(
+        self,
+        bot: commands.Bot,
+        warning_channel_id: int,
+        *,
+        warning_minutes: int = 30,
+    ):
         self.bot = bot
-        self.check_channels.start()
+        self.warning_channel_id = warning_channel_id
+        self.warning_minutes = warning_minutes
 
-    def cog_unload(self):
-        self.check_channels.cancel()
+        self._warning_tasks: set[asyncio.Task] = set()
 
-    @tasks.loop(hours=1)
-    async def check_channels(self):
+    def cog_unload(self) -> None:
+        """Cancel active warning tasks when the cog unloads."""
+        for task in self._warning_tasks:
+            task.cancel()
+
+        self._warning_tasks.clear()
+
+    @staticmethod
+    def _ensure_utc(value: datetime) -> datetime:
+        """Ensure a datetime is timezone-aware and converted to UTC."""
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+
+        return value.astimezone(timezone.utc)
+
+    def schedule_warning(
+        self,
+        *,
+        guild_id: int,
+        starts_at_utc: datetime,
+        team1_mention: str,
+        team2_mention: str,
+    ) -> None:
         """
-        Every hour:
-        - Look for scheduling channels (name contains '-vs-').
-        - If channel is older than FORCE_WARN_DAYS and not yet warned:
-          * Send a warning message.
-          * Mark topic with FORCE_WARN_MARKER (⚠️ by default).
-          * Prefix the channel name with ⚠️ so it’s visually clear the bot is forcing/scheduling.
+        Schedule an automatic warning for a forced match.
         """
-        now = datetime.utcnow()
 
-        for guild in self.bot.guilds:
-            for ch in guild.text_channels:
-                name = ch.name or ""
-                topic = ch.topic or ""
+        starts_at_utc = self._ensure_utc(starts_at_utc)
 
-                # Only consider scheduling-style channels: name contains "-vs-"
-                if "-vs-" not in name.lower():
-                    continue
+        task = asyncio.create_task(
+            self._warning_worker(
+                guild_id=guild_id,
+                starts_at_utc=starts_at_utc,
+                team1_mention=team1_mention,
+                team2_mention=team2_mention,
+            )
+        )
 
-                # Skip if already warned (marker in topic)
-                if FORCE_WARN_MARKER in (topic or ""):
-                    continue
+        self._warning_tasks.add(task)
+        task.add_done_callback(self._warning_tasks.discard)
 
-                # Check age (UTC)
-                created_utc = ch.created_at.replace(tzinfo=None)
-                age_days = (now - created_utc).days
-                if age_days < FORCE_WARN_DAYS:
-                    continue
+    async def _warning_worker(
+        self,
+        *,
+        guild_id: int,
+        starts_at_utc: datetime,
+        team1_mention: str,
+        team2_mention: str,
+    ) -> None:
+        warning_time = starts_at_utc - timedelta(
+            minutes=self.warning_minutes
+        )
 
-                # Try to get team names from topic: "Team1 Vs Team2"
-                t1_name = None
-                t2_name = None
+        seconds_until_warning = (
+            warning_time - datetime.now(timezone.utc)
+        ).total_seconds()
 
-                if topic and " Vs " in topic:
-                    parts = topic.split(" Vs ", 1)
-                    if len(parts) == 2:
-                        t1_name = parts[0].strip()
-                        t2_name = parts[1].strip()
+        if seconds_until_warning > 0:
+            await asyncio.sleep(seconds_until_warning)
 
-                # If topic failed, fallback: parse from channel name "team1-vs-team2"
-                if not t1_name or not t2_name:
-                    lower_name = name.lower()
-                    if "-vs-" in lower_name:
-                        p1, p2 = lower_name.split("-vs-", 1)
-                        t1_name = p1.replace("-", " ").strip()
-                        t2_name = p2.replace("-", " ").strip()
+        channel = self.bot.get_channel(self.warning_channel_id)
 
-                if not t1_name or not t2_name:
-                    # Can't parse team names; skip this channel
-                    continue
-
-                # Resolve to roles or keep plain text
-                t1_role, t1_mention, _ = resolve_team_any(guild, t1_name)
-                t2_role, t2_mention, _ = resolve_team_any(guild, t2_name)
-
-                # Build and send the warning message
-                warn_msg = (
-                    f"{t1_mention} {t2_mention} "
-                    "You Have Ran Out Of Time To Schedule. A Time Has Been Forced, "
-                    "Meaning If One Player From One Team Joins Before The 15 Minute Late Time, That Team Will Win."
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(
+                    self.warning_channel_id
                 )
-                try:
-                    await ch.send(warn_msg)
-                except Exception:
-                    # If we can't send a message, don't try to edit name/topic either
-                    continue
+            except discord.HTTPException:
+                logger.exception(
+                    "Could not fetch force-time warning channel."
+                )
+                return
 
-                # Mark as warned by updating topic
-                new_topic = (topic or "").strip()
-                if FORCE_WARN_MARKER not in new_topic:
-                    new_topic = (new_topic + " " + FORCE_WARN_MARKER).strip()
+        if not isinstance(channel, discord.TextChannel):
+            logger.error(
+                "Configured warning channel is not a text channel."
+            )
+            return
 
-                try:
-                    await ch.edit(topic=new_topic, reason="Force-time auto warning sent")
-                except Exception:
-                    # Topic edit failed; continue with name attempt anyway
-                    pass
+        match_timestamp = int(starts_at_utc.timestamp())
 
-                # Also prefix the channel name with the warning emoji so users know
-                # that the bot had to step in and schedule/force this match.
-                try:
-                    old_name = ch.name or ""
-                    if not old_name.startswith(FORCE_WARN_MARKER):
-                        new_name = f"{FORCE_WARN_MARKER}{old_name}"
-                        # Discord hard limit is 100 chars; trim if needed
-                        if len(new_name) > 100:
-                            new_name = new_name[:100]
-                        await ch.edit(name=new_name, reason="Mark channel as force-time scheduled")
-                except Exception:
-                    # Best-effort; do not crash the loop
-                    pass
+        message = (
+            f"⚠️ **Forced match reminder**\n\n"
+            f"{team1_mention} vs. {team2_mention}\n"
+            f"Match starts <t:{match_timestamp}:R> "
+            f"(<t:{match_timestamp}:F>).\n\n"
+            f"Please be ready."
+        )
 
-    @check_channels.before_loop
-    async def before_check_channels(self):
-        await self.bot.wait_until_ready()
+        try:
+            await channel.send(
+                message,
+                allowed_mentions=discord.AllowedMentions(
+                    roles=True,
+                    users=True,
+                    everyone=False,
+                ),
+            )
+        except discord.HTTPException:
+            logger.exception(
+                "Failed to send force-time warning."
+            )
 
 
 
