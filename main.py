@@ -18,7 +18,7 @@ from discord import Object, app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
-from typing import Optional  # add List only if you truly still use List[...]
+from typing import Any, Optional, Literal
 MATCHES: dict[str, MatchAssignment] = {}
 MATCHES: dict[str, "MatchAssignment"] = {}
 RoleType = Literal["tank", "healer", "dps"]
