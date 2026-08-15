@@ -3491,146 +3491,144 @@ class ScrimAlertLoop(commands.Cog):
 
 
 # ---------------- FIXED TimeAcceptView ----------------
+
 class TimeAcceptView(discord.ui.View):
     def __init__(
         self,
-        week: str,
-        time: str,
+        *,
+        guild: discord.Guild,
+        team1_role: discord.Role,
+        team2_role: discord.Role,
         team1_name: str,
         team2_name: str,
-        starts_at_utc=None,
-        *,
+        starts_at_utc: datetime,
+        time_str: str,
         timeout: Optional[float] = None,
     ):
         super().__init__(timeout=timeout)
 
-        self.week = week
-        self.time = time
+        self.guild = guild
+        self.team1_role = team1_role
+        self.team2_role = team2_role
         self.team1_name = team1_name
         self.team2_name = team2_name
         self.starts_at_utc = starts_at_utc
+        self.time_str = time_str
+        self.resolved = False
 
-        self.team1_accepted = False
-        self.team2_accepted = False
-        self.finalized = False
-
-        self.team1_user_id: Optional[int] = None
-        self.team2_user_id: Optional[int] = None
-
-        self.team1_button = discord.ui.Button(
-            label=f"Accept for {team1_name}",
-            style=discord.ButtonStyle.success,
-            custom_id=f"time_accept:team1:{week}:{time}",
-        )
-
-        self.team2_button = discord.ui.Button(
-            label=f"Accept for {team2_name}",
-            style=discord.ButtonStyle.success,
-            custom_id=f"time_accept:team2:{week}:{time}",
-        )
-
-        self.team1_button.callback = self.accept_team1
-        self.team2_button.callback = self.accept_team2
-
-        self.add_item(self.team1_button)
-        self.add_item(self.team2_button)
-
-    async def accept_team1(self, interaction: discord.Interaction):
-        if self.finalized:
-            await interaction.response.send_message(
-                "This match has already been finalized.",
-                ephemeral=True,
-            )
-            return
-
-        if self.team1_accepted:
-            await interaction.response.send_message(
-                f"{self.team1_name} has already accepted.",
-                ephemeral=True,
-            )
-            return
-
-        self.team1_accepted = True
-        self.team1_user_id = interaction.user.id
-        self.team1_button.disabled = True
-
-        await interaction.response.edit_message(view=self)
-
-        await self._finalize_if_ready(interaction)
-
-    async def accept_team2(self, interaction: discord.Interaction):
-        if self.finalized:
-            await interaction.response.send_message(
-                "This match has already been finalized.",
-                ephemeral=True,
-            )
-            return
-
-        if self.team2_accepted:
-            await interaction.response.send_message(
-                f"{self.team2_name} has already accepted.",
-                ephemeral=True,
-            )
-            return
-
-        self.team2_accepted = True
-        self.team2_user_id = interaction.user.id
-        self.team2_button.disabled = True
-
-        await interaction.response.edit_message(view=self)
-
-        await self._finalize_if_ready(interaction)
-
-    async def _finalize_if_ready(
+    async def interaction_check(
         self,
         interaction: discord.Interaction,
-    ):
-        if not self.team1_accepted or not self.team2_accepted:
-            return
+    ) -> bool:
+        """
+        Only members with either participating team role may use the buttons.
+        """
 
-        if self.finalized:
-            return
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "You cannot use this button.",
+                ephemeral=True,
+            )
+            return False
 
-        self.finalized = True
+        member = interaction.user
 
-        # Disable both buttons permanently.
-        self.team1_button.disabled = True
-        self.team2_button.disabled = True
-
-        if interaction.message:
-            await interaction.message.edit(view=self)
-
-        # Create the assignment post.
-        assignment_view = AssignmentClaimView(
-            self.week,
-            self.time,
-            self.team1_name,
-            self.team2_name,
+        has_team_role = (
+            self.team1_role in member.roles
+            or self.team2_role in member.roles
         )
 
-        assignment_text = (
-            f"## Staff Assignments\n"
-            f"**Week:** {self.week}\n"
-            f"**Time:** {self.time}\n"
-            f"**Match:** {self.team1_name} vs {self.team2_name}\n\n"
-            f"Claim a position using the buttons below."
-        )
+        if not has_team_role:
+            await interaction.response.send_message(
+                "Only members of one of the participating teams can respond.",
+                ephemeral=True,
+            )
+            return False
 
-        # Use the same assignments channel constant already in your bot.
-        assignments_channel = interaction.guild.get_channel(
-            ASSIGNMENTS_CHANNEL_ID
-        ) if interaction.guild else None
+        return True
 
-        if not isinstance(assignments_channel, discord.TextChannel):
-            print(
-                "ERROR: ASSIGNMENTS_CHANNEL_ID does not point to a text channel."
+    def _disable_buttons(self) -> None:
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+
+    async def _finish(
+        self,
+        interaction: discord.Interaction,
+        *,
+        accepted: bool,
+    ) -> None:
+        if self.resolved:
+            await interaction.response.send_message(
+                "This match time has already been resolved.",
+                ephemeral=True,
             )
             return
 
-        await assignments_channel.send(
-            assignment_text,
-            view=assignment_view,
+        self.resolved = True
+        self._disable_buttons()
+
+        user = interaction.user
+        user_name = getattr(user, "display_name", str(user))
+
+        if accepted:
+            result_text = (
+                f"✅ **Match time accepted**\n"
+                f"**{self.team1_name}** vs **{self.team2_name}**\n"
+                f"Time: **{self.time_str}**\n"
+                f"Accepted by: {user_name}"
+            )
+        else:
+            result_text = (
+                f"❌ **Match time declined**\n"
+                f"**{self.team1_name}** vs **{self.team2_name}**\n"
+                f"Time: **{self.time_str}**\n"
+                f"Declined by: {user_name}"
+            )
+
+        await interaction.response.edit_message(
+            content=result_text,
+            view=self,
         )
+
+        # Put your existing follow-up logic here.
+        if accepted:
+            # Example:
+            #
+            # await post_single_assignment_message(
+            #     guild=self.guild,
+            #     team1_role=self.team1_role,
+            #     team2_role=self.team2_role,
+            #     team1_name=self.team1_name,
+            #     team2_name=self.team2_name,
+            #     starts_at_utc=self.starts_at_utc,
+            #     time_str=self.time_str,
+            # )
+            pass
+
+    @discord.ui.button(
+        label="Accept time",
+        style=discord.ButtonStyle.success,
+        emoji="✅",
+    )
+    async def accept_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await self._finish(interaction, accepted=True)
+
+    @discord.ui.button(
+        label="Decline time",
+        style=discord.ButtonStyle.danger,
+        emoji="❌",
+    )
+    async def decline_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await self._finish(interaction, accepted=False)
 
 
 # ---------------- UPDATED ForceTimeView ----------------
@@ -3924,7 +3922,6 @@ class SubmitTimeModal(discord.ui.Modal, title="Submit Match Time"):
             )
 
         view = TimeAcceptView(
-            guild=guild,
             team1_role=team1_role,
             team2_role=team2_role,
             team1_name=team1_name,
