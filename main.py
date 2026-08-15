@@ -3407,25 +3407,21 @@ def ensure_utc(value: datetime | None) -> datetime | None:
         return None
 
     if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
+        value = value.replace(tzinfo=timezone.utc)
 
     return value.astimezone(timezone.utc)
 
 
 def parse_match_time(value: str) -> datetime:
     """
-    Expected format:
+    Parse:
         YYYY-MM-DD HH:MM UTC
-
     Example:
         2026-08-20 19:30 UTC
     """
-    value = value.strip().upper()
+    text = value.strip().upper().replace(" UTC", "")
 
-    if value.endswith(" UTC"):
-        value = value[:-4].strip()
-
-    parsed = datetime.strptime(value, "%Y-%m-%d %H:%M")
+    parsed = datetime.strptime(text, "%Y-%m-%d %H:%M")
     return parsed.replace(tzinfo=timezone.utc)
 
 
@@ -3433,7 +3429,7 @@ class SubmitTimeModal(discord.ui.Modal, title="Submit Match Details"):
     week = discord.ui.TextInput(
         label="Week",
         placeholder="Example: Week 3",
-        required=False,
+        required=True,
         max_length=50,
     )
 
@@ -3441,19 +3437,19 @@ class SubmitTimeModal(discord.ui.Modal, title="Submit Match Details"):
         label="Match time",
         placeholder="YYYY-MM-DD HH:MM UTC",
         required=True,
-        max_length=30,
+        max_length=40,
     )
 
-    team1_name = discord.ui.TextInput(
-        label="Team 1",
-        placeholder="Team 1 name",
+    team1_name_input = discord.ui.TextInput(
+        label="Team 1 name",
+        placeholder="Enter team 1 name",
         required=True,
         max_length=100,
     )
 
-    team2_name = discord.ui.TextInput(
-        label="Team 2",
-        placeholder="Team 2 name",
+    team2_name_input = discord.ui.TextInput(
+        label="Team 2 name",
+        placeholder="Enter team 2 name",
         required=True,
         max_length=100,
     )
@@ -3469,6 +3465,20 @@ class SubmitTimeModal(discord.ui.Modal, title="Submit Match Details"):
         self.parent_view = parent_view
         self.original_message = original_message
 
+        # Pre-fill the modal with the values currently held by ForceTimeView.
+        self.week.default = str(parent_view.week or "")
+
+        if parent_view.starts_at_utc:
+            current_time = ensure_utc(parent_view.starts_at_utc)
+            self.match_time.default = current_time.strftime(
+                "%Y-%m-%d %H:%M UTC"
+            )
+        else:
+            self.match_time.default = ""
+
+        self.team1_name_input.default = parent_view.team1_name or ""
+        self.team2_name_input.default = parent_view.team2_name or ""
+
     async def on_submit(self, interaction: discord.Interaction):
         try:
             starts_at_utc = parse_match_time(str(self.match_time.value))
@@ -3479,15 +3489,22 @@ class SubmitTimeModal(discord.ui.Modal, title="Submit Match Details"):
             )
             return
 
-        # Save the submitted values back to the ForceTimeView.
         self.parent_view.week = str(self.week.value).strip()
-        self.parent_view.time_str = str(self.match_time.value).strip()
         self.parent_view.starts_at_utc = starts_at_utc
-        self.parent_view.team1_name = str(self.team1_name.value).strip()
-        self.parent_view.team2_name = str(self.team2_name.value).strip()
+        self.parent_view.time_str = starts_at_utc.strftime(
+            "%A, %B %d at %I:%M %p UTC"
+        )
+        self.parent_view.team1_name = str(
+            self.team1_name_input.value
+        ).strip()
+        self.parent_view.team2_name = str(
+            self.team2_name_input.value
+        ).strip()
 
         await interaction.response.edit_message(
-            content=self.parent_view._build_staff_message(interaction.guild),
+            content=self.parent_view._build_staff_message(
+                interaction.guild
+            ),
             view=self.parent_view,
         )
 
@@ -3496,8 +3513,8 @@ class ForceTimeView(discord.ui.View):
     def __init__(
         self,
         *,
-        team1_role: discord.Role,
-        team2_role: discord.Role,
+        team1_role: discord.Role | None,
+        team2_role: discord.Role | None,
         team1_mention: str,
         team2_mention: str,
         team1_name: str,
@@ -3506,7 +3523,7 @@ class ForceTimeView(discord.ui.View):
         starts_at_utc: datetime,
         week: str = "",
     ):
-        super().__init__(timeout=None)
+        super().__init__(timeout=900)
 
         self.team1_role = team1_role
         self.team2_role = team2_role
@@ -3524,19 +3541,32 @@ class ForceTimeView(discord.ui.View):
         self.original_message: discord.Message | None = None
 
     def _build_staff_message(self, guild: discord.Guild | None) -> str:
+        team1_role_text = (
+            self.team1_role.mention
+            if self.team1_role
+            else self.team1_mention
+        )
+
+        team2_role_text = (
+            self.team2_role.mention
+            if self.team2_role
+            else self.team2_mention
+        )
+
         return (
-            "⚔️ **Forced Match Time**\n\n"
-            f"**Week:** {self.week or 'Not specified'}\n"
-            f"**Time:** {self.time_str}\n"
-            f"**Team 1:** {self.team1_mention} ({self.team1_name})\n"
-            f"**Team 2:** {self.team2_mention} ({self.team2_name})\n\n"
-            "Staff: choose **Accept**, **Deny**, or **Edit Time**."
+            "## Forced Match Review\n\n"
+            f"**Week:** {self.week or 'Not selected'}\n"
+            f"**Time:** {self.time_str or 'Not selected'}\n"
+            f"**Team 1:** {self.team1_name} {team1_role_text}\n"
+            f"**Team 2:** {self.team2_name} {team2_role_text}\n\n"
+            "Staff: use **Submit Time** to edit the match details, "
+            "or choose **Accept** / **Deny**."
         )
 
     @discord.ui.button(
-        label="Edit Time",
+        label="Submit Time",
         style=discord.ButtonStyle.primary,
-        custom_id="force_time_edit",
+        custom_id="force_time_submit",
     )
     async def submit_time(
         self,
@@ -3570,55 +3600,42 @@ class ForceTimeView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ):
-        try:
-            if self.starts_at_utc is None:
-                await interaction.response.send_message(
-                    "A valid match start time is required.",
-                    ephemeral=True,
-                )
-                return
-
-            self.starts_at_utc = ensure_utc(self.starts_at_utc)
-
-            # Disable all buttons after acceptance.
-            for child in self.children:
-                if isinstance(child, discord.ui.Button):
-                    child.disabled = True
-
-            await interaction.response.edit_message(
-                content=(
-                    "✅ **Forced match accepted.**\n\n"
-                    f"**Week:** {self.week or 'Not specified'}\n"
-                    f"**Time:** {self.time_str}\n"
-                    f"**Team 1:** {self.team1_mention} ({self.team1_name})\n"
-                    f"**Team 2:** {self.team2_mention} ({self.team2_name})"
-                ),
-                view=self,
+        if self.starts_at_utc is None:
+            await interaction.response.send_message(
+                "A match start time must be submitted first.",
+                ephemeral=True,
             )
+            return
 
-            # Call your scheduling function here using the exact signature
-            # of your actual function.
-            #
-            # Example:
-            #
-            # await post_single_assignment_message(
-            #     guild=interaction.guild,
-            #     starts_at_utc=self.starts_at_utc,
-            #     time_str=self.time_str,
-            #     team1_role=self.team1_role,
-            #     team2_role=self.team2_role,
-            #     team1_name=self.team1_name,
-            #     team2_name=self.team2_name,
-            # )
+        self.starts_at_utc = ensure_utc(self.starts_at_utc)
 
-        except Exception:
-            logger.exception("Error while accepting forced match")
+        # Disable the buttons after acceptance.
+        for child in self.children:
+            child.disabled = True
 
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "An error occurred while accepting the forced match.",
-                    ephemeral=True,
-                )
+        await interaction.response.edit_message(
+            content=(
+                "✅ **Forced match accepted.**\n\n"
+                f"**Week:** {self.week or 'N/A'}\n"
+                f"**Time:** {self.time_str}\n"
+                f"**Team 1:** {self.team1_name}\n"
+                f"**Team 2:** {self.team2_name}"
+            ),
+            view=self,
+        )
+
+        # Call your scheduling function here, using its actual signature.
+        #
+        # Example:
+        #
+        # await post_single_assignment_message(
+        #     guild=interaction.guild,
+        #     starts_at_utc=self.starts_at_utc,
+        #     team1_role=self.team1_role,
+        #     team2_role=self.team2_role,
+        #     team1_name=self.team1_name,
+        #     team2_name=self.team2_name,
+        # )
 
     @discord.ui.button(
         label="Deny",
@@ -3630,24 +3647,13 @@ class ForceTimeView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ):
-        try:
-            for child in self.children:
-                if isinstance(child, discord.ui.Button):
-                    child.disabled = True
+        for child in self.children:
+            child.disabled = True
 
-            await interaction.response.edit_message(
-                content="❌ **Forced match denied.**",
-                view=self,
-            )
-
-        except Exception:
-            logger.exception("Error while denying forced match")
-
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "An error occurred while denying the forced match.",
-                    ephemeral=True,
-                )
+        await interaction.response.edit_message(
+            content="❌ **Forced match denied.**",
+            view=self,
+        )
 
 # -----------------------------
 # Admin panel view
