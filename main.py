@@ -3474,7 +3474,7 @@ def parse_match_time(value: str) -> datetime:
 # Submit time modal
 # -----------------------------
 
-class SubmitTimeModal(discord.ui.Modal, title="Schedule Match"):
+class SubmitTimeModal(discord.ui.Modal, title="Set Match Time"):
     week = discord.ui.TextInput(
         label="Week",
         placeholder="Example: Week 3",
@@ -3491,14 +3491,14 @@ class SubmitTimeModal(discord.ui.Modal, title="Schedule Match"):
 
     team1_name = discord.ui.TextInput(
         label="Team 1 name",
-        placeholder="Enter Team 1's name",
+        placeholder="Enter Team 1",
         required=True,
         max_length=100,
     )
 
     team2_name = discord.ui.TextInput(
         label="Team 2 name",
-        placeholder="Enter Team 2's name",
+        placeholder="Enter Team 2",
         required=True,
         max_length=100,
     )
@@ -3509,29 +3509,25 @@ class SubmitTimeModal(discord.ui.Modal, title="Schedule Match"):
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
-            starts_at_utc = datetime.strptime(
-                self.match_time.value.strip(),
-                "%Y-%m-%d %H:%M UTC",
-            ).replace(tzinfo=timezone.utc)
+            starts_at_utc = parse_match_time(self.match_time.value)
 
-        except ValueError:
+            self.parent_view.week = self.week.value.strip()
+            self.parent_view.time_str = self.match_time.value.strip()
+            self.parent_view.starts_at_utc = starts_at_utc
+            self.parent_view.team1_name = self.team1_name.value.strip()
+            self.parent_view.team2_name = self.team2_name.value.strip()
+
             await interaction.response.send_message(
-                "Invalid time format. Use: `YYYY-MM-DD HH:MM UTC`",
+                "Match information saved.",
                 ephemeral=True,
             )
-            return
 
-        # Save the submitted values to the parent view
-        self.parent_view.week = self.week.value.strip()
-        self.parent_view.starts_at_utc = starts_at_utc
-        self.parent_view.time_str = self.match_time.value.strip()
-        self.parent_view.team1_name = self.team1_name.value.strip()
-        self.parent_view.team2_name = self.team2_name.value.strip()
-
-        await interaction.response.send_message(
-            "Match details saved successfully.",
-            ephemeral=True,
-        )
+        except Exception:
+            logger.exception("Failed to process match-time form")
+            await interaction.response.send_message(
+                "The time format is invalid. Use: YYYY-MM-DD HH:MM UTC",
+                ephemeral=True,
+            )
 
 
 # -----------------------------
