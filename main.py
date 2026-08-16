@@ -1,63 +1,54 @@
-from __future__ import annotations
-
-import logging
 import asyncio
 import json
 import os
-import random
 import re
+import random
+import io
+import requests
+import traceback
+import html as html_module
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from urllib.parse import parse_qs, urlparse
-from typing import Optional, List
-import uuid
-import aiohttp
-import discord
-from aiohttp import web
-from discord import Object, app_commands
-from discord.ext import commands, tasks
-from dotenv import load_dotenv
-from PIL import Image, ImageDraw, ImageFont
-from typing import Optional  # add List only if you truly still use List[...]
-MATCHES: dict[str, MatchAssignment] = {}
-MATCHES: dict[str, "MatchAssignment"] = {}
-from typing import Literal
-RoleType = Literal["tank", "healer", "dps"]
-logger = logging.getLogger(__name__)
 
-load_dotenv()
+from urllib.parse import urlparse, parse_qs
+from datetime import datetime, timedelta
+from typing import Optional, Tuple
+from pathlib import Path
+
+import dotenv
+from dotenv import load_dotenv
+
+import aiohttp
+from aiohttp import web
+
+import bs4
+from bs4 import BeautifulSoup
+
+from PIL import Image, ImageDraw, ImageFont
+
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
+
+import discord
+from discord.ext import commands, tasks
+from discord import app_commands, Object
 
 
 # ---------------- CONFIG ----------------
 TEST_GUILD_ID = 1409038531329917044
 
 # Channel IDs
-# Channel IDs
 TRANSACTIONS_CHANNEL_ID = 1416462357718241410
 TRANSACTIONS_HELP_CHANNEL_ID = 1426624895722197193
 MATCH_SCORE_CHANNEL_ID = 1409043896989777982
 MATCH_TIMES_CHANNEL_ID = 1409044495743582268
-
-# NEW:
-COMMENTATOR_ROLE_ID = 1411841463175876729                # <-- your @Commentator role id
-
-ASSIGNMENTS_CHANNEL_ID = 1454349005202002012  # set yours
-
-NUM_MAIN_COMMENTATORS = 2
-NUM_BACKUP_COMMENTATORS = 2
-
-# optional: where to log denies/needs replacement (can be same as assignments)
-ALERT_LOG_CHANNEL_ID = ASSIGNMENTS_CHANNEL_ID
-
-
+ASSIGNMENTS_CHANNEL_ID = 1454349005202002012
 SCRIM_CATEGORY_ID = 1410590393527046275
-SEEDING_POINTS_CHANNEL_ID = 1517019335846006784  # <- replace 0 with your seeding-points channel ID
+SEEDING_POINTS_CHANNEL_ID = 1409043839418896425  # <- replace 0 with your seeding-points channel ID
 
 
 # Force-time review channel (staff-only announcement)
-FORCE_TIME_REVIEW_CHANNEL_ID = 1521587566657404929
-
+FORCE_TIME_REVIEW_CHANNEL_ID = 1538368507421655091
 
 # Role IDs
 HEAD_REF_ROLE_ID = 1521592074485629088
@@ -70,19 +61,19 @@ CO_CAPTAIN_ROLE_ID = 1409044157334290492
 TEAM_PLAYER_ROLE_ID = 1409044068482158744
 TEAM_EXEC_ROLE_ID = 1521591557747245277
 
-BOARD_OF_DIRECTORS_ROLE_ID = 1513754689580040232  # @Board Of Directors
-COMMUNITY_MANAGER_ROLE_ID = 1409038947413135370   # @Community Manager
-SUPERVISOR_ROLE_ID        = 1476793870887948411   # @Supervisor
-DEVELOPMENT_TEAM_ROLE_ID  = 1409057069566525471  # <-- replace 0 with your Dev Team role ID
+BOARD_OF_DIRECTORS_ROLE_ID = 1409038947413135370  # @Board Of Directors
+COMMUNITY_MANAGER_ROLE_ID = 1476793870887948411   # @Community Manager
+SUPERVISOR_ROLE_ID        = 1409057069566525471   # @Supervisor
+DEVELOPMENT_TEAM_ROLE_ID  = 1465209483872567369   # <-- replace 0 with your Dev Team role ID
 
-# FAQ / misc roles
-UNBORN_CAPTAIN_ROLE_ID = 1409043912487735387
-EVENT_PING_ROLE_ID = 1483199997272002680
-SCRIM_REFEREE_ROLE_ID = 1517719944916111501  # <-- replace 0 with your Scrim Referee role ID
+MAX_EXECUTIVES = 1
+MAX_CAPTAINS = 1
+MAX_CO_CAPTAINS = 2
 
 BRACKET_CHANNEL_ID = 1409043839418896425
 BRACKET_BASE_IMAGE_PATH = "MMM BRACKET.png"
 BRACKET_OUTPUT_IMAGE_PATH = "MMM_BRACKET_FILLED.png"
+
 
 ROSTER_LOCKED = False
 SEEDING_OPEN = False
@@ -107,6 +98,7 @@ DEFAULT_CONFIG = {
         "team_member": TEAM_PLAYER_ROLE_ID,
         "caster": CASTER_ROLE_ID,
         "referee": REF_ROLE_ID,
+        "stream_watcher": STREAM_WATCHER_ROLE_ID,
     },
     "roster_rules": {
         "max_roster": 12,
@@ -124,9 +116,25 @@ PLAYER_HISTORY_FILE = data_dir / "player_history.json"
 INVITES_FILE = data_dir / "invites.json"
 ROSTER_LOCK_FILE = data_dir / "roster_lock.json"
 CONFIG_FILE = data_dir / "config.json"
+YOUTUBE_STATE_FILE = data_dir / "youtube_state.json"
 CODES_STATE_FILE = data_dir / "codes_state.json"
 HEADSETS_FILE = data_dir / "headsets.json"
-SEEDING_STATE_FILE = data_dir / "seeding_state.json"
+GROUPS_FILE = data_dir / "groups.json"
+
+# ---------- STANDINGS WEB CACHE ----------
+STANDINGS_CHANNEL_ID = 1453096022292168947
+STANDINGS_CACHE_FILE = data_dir / "standings_cache.json"
+PERSIST_STANDINGS_CACHE = True
+
+_standings_cache = {
+    "html": None,
+    "raw": None,
+    "ts": None,
+    "message_id": None,
+    "author": None,
+}
+
+_standings_lock = asyncio.Lock()
 
 
 
@@ -163,13 +171,6 @@ BRACKET_SLOT_COORDS = {
 }
 
 
-from enum import StrEnum  # Python 3.11+
-# for 3.10, use: from enum import Enum and subclass str, Enum
-
-class RoleType(StrEnum):
-    REF = "ref"
-    CASTER = "caster"
-    COMMENTATOR = "commentator"
 
 
 def format_list_arrow(items: list[str]) -> str:
@@ -177,32 +178,7 @@ def format_list_arrow(items: list[str]) -> str:
         return "> • None"
     return "\n".join(f"> • {it}" for it in items)
 
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Literal, Optional
 
-RoleType = Literal["ref", "caster", "commentator"]
-
-MATCHES: dict[str, "MatchAssignment"] = {}
-
-
-@dataclass
-class MatchAssignment:
-    guild_id: int
-    match_id: str
-    starts_at_utc: datetime
-
-    alerted_main: bool = False
-    alerted_backup: bool = False
-
-    ref_main: Optional[int] = None
-    ref_backup: Optional[int] = None
-
-    caster_main: Optional[int] = None
-    caster_backup: Optional[int] = None
-
-    comm_main: Optional[int] = None
-    comm_backup: Optional[int] = None
 
 
 
@@ -210,10 +186,9 @@ DEFAULT_HEADSETS = [
     "Meta Quest 2",
     "Meta Quest 3",
     "Meta Quest 3s",
-    "Meta Quest Pro",
-    "Oculus Rift S",
-    "Valve Index",
     "HTC Vive",
+    "HTC Vive Pro",
+    "Valve Index",
 ]
 
 def load_headsets() -> list[str]:
@@ -237,22 +212,6 @@ def save_headsets(headsets: list[str]):
         pass
 
 
-def load_seeding_state() -> dict:
-    if not SEEDING_STATE_FILE.is_file():
-        return {}
-    try:
-        with SEEDING_STATE_FILE.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-def save_seeding_state(data: dict):
-    try:
-        with SEEDING_STATE_FILE.open("w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception:
-        pass
 
 
 
@@ -309,133 +268,6 @@ def load_teams() -> list[dict]:
     return []
 
 
-def generate_forced_time() -> tuple[str, datetime]:
-    """
-    Returns: (time_str, starts_at_utc) where starts_at_utc is tz-aware UTC.
-    Adjust the logic to your league rules.
-    """
-    now = datetime.now(timezone.utc)
-
-    # Pick 1–5 days from now
-    days_ahead = random.randint(1, 5)
-    day = (now + timedelta(days=days_ahead)).date()
-
-    # Pick an hour slot (UTC)
-    hour = random.choice([18, 19, 20, 21, 22])  # adjust
-    minute = random.choice([0, 30])
-
-    starts_at_utc = datetime(
-        year=day.year,
-        month=day.month,
-        day=day.day,
-        hour=hour,
-        minute=minute,
-        tzinfo=timezone.utc,
-    )
-
-    time_str = starts_at_utc.strftime("%a %b %d, %H:%M UTC")
-    return time_str, starts_at_utc
-
-
-async def post_single_assignment_message(
-    bot: commands.Bot,
-    guild: discord.Guild,
-    *,
-    team1_name: str,
-    team2_name: str,
-    week: str,
-    time_str: str,
-    starts_at_utc: datetime,
-) -> MatchAssignment:
-    channel = guild.get_channel(ASSIGNMENTS_CHANNEL_ID)
-
-    if channel is None:
-        channel = await bot.fetch_channel(ASSIGNMENTS_CHANNEL_ID)
-
-    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-        raise RuntimeError(
-            "ASSIGNMENTS_CHANNEL_ID is not a text channel or thread."
-        )
-
-    if starts_at_utc.tzinfo is None:
-        raise ValueError("starts_at_utc must be timezone-aware.")
-
-    starts_at_utc = starts_at_utc.astimezone(timezone.utc)
-
-    match_id = uuid.uuid4().hex[:10]
-
-    assignment = MatchAssignment(
-        match_id=match_id,
-        guild_id=guild.id,
-        team1_name=team1_name,
-        team2_name=team2_name,
-        week=week,
-        time_str=time_str,
-        starts_at_utc=starts_at_utc,
-        assignments_channel_id=channel.id,
-        assignments_message_id=0,
-    )
-
-    MATCHES[match_id] = assignment
-
-    view = AssignmentClaimView(match_id=match_id)
-    content = render_assignment_post(assignment)
-
-    try:
-        message = await channel.send(content=content, view=view)
-    except Exception:
-        MATCHES.pop(match_id, None)
-        raise
-
-    assignment.assignments_message_id = message.id
-    return assignment
-
-
-# ---------------- PING helper (single assignments channel) ----------------
-
-def build_assignments_ping_header(guild: discord.Guild) -> str:
-    """
-    Return the role mentions you want to ping for a new assignment post.
-    Ping once (only when posting the message).
-    """
-    role_ids: list[int] = [
-        HEAD_REF_ROLE_ID, REF_ROLE_ID,
-        HEAD_CASTER_ROLE_ID, CASTER_ROLE_ID,
-        COMMENTATOR_ROLE_ID,
-    ]
-
-    mentions: list[str] = []
-    for rid in role_ids:
-        r = guild.get_role(rid)
-        if r:
-            mentions.append(r.mention)
-
-    return " ".join(mentions)
-
-
-async def send_to_assignments_channel_ping_once(
-    *,
-    guild: discord.Guild,
-    content: str,
-    view: discord.ui.View,
-    ping: bool = True,
-):
-    ch = guild.get_channel(ASSIGNMENTS_CHANNEL_ID)
-    if not isinstance(ch, discord.TextChannel):
-        return None
-
-    prefix = ""
-    if ping:
-        header = build_assignments_ping_header(guild)
-        if header:
-            prefix = header + "\n"
-
-    return await ch.send(
-        prefix + content,
-        view=view,
-        allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
-    )
-
 
 # invites.json structure:
 # {
@@ -489,6 +321,311 @@ def remove_pending_invite(team_role_id: int, user_id: int):
     save_invites(data)
 
 
+def load_groups_state() -> dict:
+    if not GROUPS_FILE.is_file():
+        return {}
+    try:
+        with GROUPS_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def save_groups_state(data: dict):
+    try:
+        with GROUPS_FILE.open("w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
+def find_member_team_role(member: discord.Member) -> discord.Role | None:
+    """
+    Strictly detect this member's real team role.
+
+    Requirements for a role to be considered a 'team role':
+    - Its ID is listed in teams.json
+    - Its name is not a separator/fake (e.g. '————————Team Roles————————')
+    - At least one non-bot member in the guild has BOTH:
+        - this role
+        - and a captain / co-captain / executive / team_player role
+    """
+
+    guild = member.guild
+
+    # Load teams.json
+    try:
+        teams = load_teams()
+    except Exception:
+        teams = []
+
+    team_ids_from_file: set[int] = set()
+    for entry in teams:
+        rid = entry.get("role_id")
+        if not rid:
+            continue
+        try:
+            team_ids_from_file.add(int(rid))
+        except (TypeError, ValueError):
+            continue
+
+    # Helper to detect obvious separator/fake roles
+    def _is_fake_team_role(r: discord.Role) -> bool:
+        name = (r.name or "").strip().lower()
+        # e.g. "————————Team Roles————————"
+        if "team roles" in name:
+            return True
+        # names that are basically just dashes/lines/underscores/spaces
+        if name and all(ch in "-—_ " for ch in name):
+            return True
+        return False
+
+    # Helper: is this role actually used as a *team* role by at least one staff/player?
+    def _is_real_team_role(r: discord.Role) -> bool:
+        if r.id not in team_ids_from_file:
+            return False
+        if _is_fake_team_role(r):
+            return False
+
+        for g_member in guild.members:
+            if g_member.bot:
+                continue
+            if r not in g_member.roles:
+                continue
+            # must have one of the global team staff/player roles
+            if any(
+                has_role_id(g_member, rid)
+                for rid in (
+                    CAPTAIN_ROLE_ID,
+                    CO_CAPTAIN_ROLE_ID,
+                    TEAM_EXEC_ROLE_ID,
+                    TEAM_PLAYER_ROLE_ID,
+                )
+            ):
+                return True
+
+        return False
+
+    # Collect member's roles that qualify as "real team roles"
+    candidates: list[discord.Role] = []
+    for r in member.roles:
+        if _is_real_team_role(r):
+            candidates.append(r)
+
+    if not candidates:
+        return None
+
+    # Return the highest role in the guild hierarchy
+    return max(candidates, key=lambda r: r.position)
+
+# ---------- STANDINGS HELPERS ----------
+
+async def _load_standings_cache():
+    global _standings_cache
+
+    if not PERSIST_STANDINGS_CACHE:
+        return
+
+    try:
+        if not STANDINGS_CACHE_FILE.is_file():
+            return
+
+        with STANDINGS_CACHE_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if isinstance(data, dict):
+            _standings_cache.update(data)
+
+    except Exception:
+        print("Failed to load standings cache:")
+        traceback.print_exc()
+
+
+async def _save_standings_cache():
+    if not PERSIST_STANDINGS_CACHE:
+        return
+
+    try:
+        tmp = STANDINGS_CACHE_FILE.with_suffix(".json.tmp")
+
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(_standings_cache, f, ensure_ascii=False, indent=2)
+
+        os.replace(tmp, STANDINGS_CACHE_FILE)
+
+    except Exception:
+        print("Failed to save standings cache:")
+        traceback.print_exc()
+
+
+def _discord_message_to_safe_html(msg: discord.Message) -> Tuple[str | None, str]:
+    """
+    Converts a Discord standings message into safe HTML.
+
+    Includes:
+    - message.content
+    - embed title
+    - embed description
+    - embed fields
+
+    Everything is escaped to prevent XSS.
+    """
+
+    raw_parts = []
+    html_parts = []
+
+    if msg.content:
+        raw_parts.append(msg.content)
+
+        escaped_content = html_module.escape(msg.content)
+        html_parts.append(f"<pre class='standings-message'>{escaped_content}</pre>")
+
+    for embed in msg.embeds:
+        embed_chunks = []
+
+        title = getattr(embed, "title", None)
+        description = getattr(embed, "description", None)
+
+        if title:
+            raw_parts.append(title)
+            embed_chunks.append(
+                f"<h3 class='standings-embed-title'>{html_module.escape(title)}</h3>"
+            )
+
+        if description:
+            raw_parts.append(description)
+            escaped_desc = html_module.escape(description).replace("\n", "<br>")
+            embed_chunks.append(
+                f"<div class='standings-embed-description'>{escaped_desc}</div>"
+            )
+
+        try:
+            for field in embed.fields:
+                field_name = html_module.escape(field.name or "")
+                field_value = html_module.escape(field.value or "").replace("\n", "<br>")
+
+                raw_parts.append(f"{field.name}\n{field.value}")
+
+                embed_chunks.append(
+                    "<div class='standings-embed-field'>"
+                    f"<strong>{field_name}</strong><br>"
+                    f"{field_value}"
+                    "</div>"
+                )
+        except Exception:
+            pass
+
+        if embed_chunks:
+            html_parts.append(
+                "<div class='standings-embed'>"
+                + "\n".join(embed_chunks)
+                + "</div>"
+            )
+
+    html = "\n".join(html_parts).strip() if html_parts else None
+    raw = "\n\n".join(raw_parts).strip()
+
+    return html, raw
+
+
+async def _update_standings_from_message(msg: discord.Message):
+    """
+    Updates the cached standings from a Discord message.
+    """
+
+    if msg is None:
+        return
+
+    if not msg.channel or getattr(msg.channel, "id", None) != STANDINGS_CHANNEL_ID:
+        return
+
+    html, raw = _discord_message_to_safe_html(msg)
+
+    if not html and not raw:
+        return
+
+    try:
+        author_name = None
+        if msg.author:
+            author_name = getattr(msg.author, "display_name", None) or getattr(msg.author, "name", None)
+
+        if msg.edited_at:
+            ts = msg.edited_at.isoformat()
+        elif msg.created_at:
+            ts = msg.created_at.isoformat()
+        else:
+            ts = datetime.utcnow().isoformat()
+
+        async with _standings_lock:
+            _standings_cache["html"] = html
+            _standings_cache["raw"] = raw
+            _standings_cache["ts"] = ts
+            _standings_cache["message_id"] = msg.id
+            _standings_cache["author"] = author_name
+
+            await _save_standings_cache()
+
+        print(f"Updated standings cache from message {msg.id}")
+
+    except Exception:
+        print("Failed to update standings cache:")
+        traceback.print_exc()
+
+
+async def _populate_initial_standings_cache():
+    """
+    Used on bot startup.
+    If cache is empty, tries to load standings from:
+    1. pinned message in standings channel
+    2. latest message in standings channel
+    """
+
+    try:
+        await _load_standings_cache()
+
+        async with _standings_lock:
+            has_cache = bool(_standings_cache.get("html") or _standings_cache.get("raw"))
+
+        if has_cache:
+            return
+
+        guild = bot.get_guild(TEST_GUILD_ID)
+        if guild is None:
+            print("Could not populate standings cache: guild not found")
+            return
+
+        ch = guild.get_channel(STANDINGS_CHANNEL_ID)
+
+        if not isinstance(ch, discord.TextChannel):
+            print("Could not populate standings cache: standings channel not found or not a text channel")
+            return
+
+        msg = None
+
+        try:
+            pinned = await ch.pins()
+            if pinned:
+                # newest pinned message first
+                pinned.sort(key=lambda m: m.created_at, reverse=True)
+                msg = pinned[0]
+        except Exception as e:
+            print("Warning: failed to read pinned standings messages:", repr(e))
+
+        if msg is None:
+            try:
+                async for m in ch.history(limit=1):
+                    msg = m
+                    break
+            except Exception as e:
+                print("Warning: failed to read standings channel history:", repr(e))
+
+        if msg:
+            await _update_standings_from_message(msg)
+
+    except Exception:
+        print("Failed to populate initial standings cache:")
+        traceback.print_exc()
+
 
 
 def add_team_to_list(role_id: int, name: str):
@@ -505,6 +642,16 @@ def add_team_to_list(role_id: int, name: str):
     except Exception:
         return
 
+    # Trigger an immediate server stats refresh (best-effort)
+    try:
+        import asyncio
+        if "bot" in globals() and hasattr(bot, "get_cog"):
+            cog = bot.get_cog("ServerStatsCog")
+            if cog and hasattr(cog, "update_now"):
+                asyncio.create_task(cog.update_now())
+    except Exception:
+        pass
+
 
 
 def load_player_history() -> dict:
@@ -519,14 +666,71 @@ def load_player_history() -> dict:
         pass
     return {}
 
-# ---------------- INTENTS ----------------
 INTENTS = discord.Intents.default()
-INTENTS.members = True
-INTENTS.presences = True   # <-- add this
-INTENTS.messages = True
-INTENTS.dm_messages = True
 INTENTS.guilds = True
+INTENTS.members = True
+INTENTS.messages = True
 INTENTS.message_content = True
+INTENTS.presences = True
+
+
+
+# -------- scan-teams command (plain app command) --------
+@app_commands.command(name="scan-teams", description="Admin: register existing team roles into teams.json")
+@app_commands.default_permissions(administrator=True)
+async def scan_teams(interaction: discord.Interaction):
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message("Use this in a server.", ephemeral=True)
+        return
+
+    team_roles = []
+    for role in guild.roles:
+        if role.is_default() or role.managed:
+            continue
+        if role.id in {
+            HEAD_REF_ROLE_ID, REF_ROLE_ID,
+            HEAD_CASTER_ROLE_ID, CASTER_ROLE_ID,
+            CAPTAIN_ROLE_ID, CO_CAPTAIN_ROLE_ID,
+            TEAM_PLAYER_ROLE_ID, TEAM_EXEC_ROLE_ID,
+            BOARD_OF_DIRECTORS_ROLE_ID, COMMUNITY_MANAGER_ROLE_ID,
+            SUPERVISOR_ROLE_ID, DEVELOPMENT_TEAM_ROLE_ID,
+            STREAM_WATCHER_ROLE_ID, UNBORN_CAPTAIN_ROLE_ID,
+            EVENT_PING_ROLE_ID, SCRIM_REFEREE_ROLE_ID,
+        }:
+            continue
+        # simple rule: name contains "team" (adjust as needed)
+        if "team" in role.name.lower():
+            team_roles.append(role)
+
+    if not team_roles:
+        await interaction.response.send_message("No candidate team roles found by scan.", ephemeral=True)
+        return
+
+    existing = []
+    if TEAMS_FILE.is_file():
+        try:
+            existing = json.loads(TEAMS_FILE.read_text("utf-8"))
+        except Exception:
+            existing = []
+    if not isinstance(existing, list):
+        existing = []
+
+    for r in team_roles:
+        if not any(str(e.get("role_id")) == str(r.id) for e in existing):
+            existing.append({"role_id": r.id, "name": r.name})
+
+    try:
+        TEAMS_FILE.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    except Exception as e:
+        await interaction.response.send_message(f"Failed to write teams.json: `{e}`", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        f"Registered {len(team_roles)} team role(s) into teams.json.",
+        ephemeral=True,
+    )
+
 
 # ---------------- HELPERS ----------------
 def has_role_id(member: discord.Member, role_id: int | None) -> bool:
@@ -536,7 +740,7 @@ def is_team_role(guild: discord.Guild, role: discord.Role) -> bool:
     protected = {
         CAPTAIN_ROLE_ID, CO_CAPTAIN_ROLE_ID, TEAM_PLAYER_ROLE_ID, TEAM_EXEC_ROLE_ID,
         HEAD_REF_ROLE_ID, REF_ROLE_ID, HEAD_CASTER_ROLE_ID, CASTER_ROLE_ID,
-        UNBORN_CAPTAIN_ROLE_ID, EVENT_PING_ROLE_ID,
+        STREAM_WATCHER_ROLE_ID, UNBORN_CAPTAIN_ROLE_ID, EVENT_PING_ROLE_ID,
     }
     if role.is_default() or role.managed or role.id in protected:
         return False
@@ -565,76 +769,13 @@ def is_team_role(guild: discord.Guild, role: discord.Role) -> bool:
 
     return False
 
-
-def mention_or_blank(guild: discord.Guild, user_id: Optional[int]) -> str:
-    if not user_id:
-        return ""
-    return f"<@{user_id}>"
-
-def mention_list(user_ids: List[int]) -> str:
-    return ", ".join(f"<@{uid}>" for uid in user_ids)
-
-def render_assignment_post(guild: discord.Guild, m: MatchAssignment) -> str:
-    # Format exactly like your example (with main + backup)
-    ref_line = ""
-    if m.ref_main:
-        ref_line += mention_or_blank(guild, m.ref_main)
-    if m.ref_backup:
-        ref_line += f" (back up) {mention_or_blank(guild, m.ref_backup)}"
-
-    caster_line = ""
-    if m.caster_main:
-        caster_line += mention_or_blank(guild, m.caster_main)
-    if m.caster_backup:
-        caster_line += f" (back up) {mention_or_blank(guild, m.caster_backup)}"
-
-    comm_line_parts = []
-    if m.comm_main:
-        comm_line_parts.append(mention_list(m.comm_main))
-    if m.comm_backup:
-        comm_line_parts.append(f"(back up) {mention_list(m.comm_backup)}")
-    comm_line = " ".join(comm_line_parts)
-
-    return (
-        f"{m.team1_name} vs {m.team2_name}\n"
-        f"> WEEK: {m.week}\n"
-        f"> Time: {m.time_str}\n"
-        f"> Referee: {ref_line}\n"
-        f"> Caster: {caster_line}\n"
-        f"> Commentators: {comm_line}\n"
-    )
-
-async def send_to_assignment_channels_ping_once(
-    bot: commands.Bot,
-    m: MatchAssignment,
-    content_without_ping: str,
-    ping_text: str,
-) -> None:
-    """
-    Edits the existing assignment message.
-    If not pinged before, prepends ping_text once.
-    """
-    channel = bot.get_channel(m.assignments_channel_id)
-    if channel is None:
-        channel = await bot.fetch_channel(m.assignments_channel_id)
-
-    msg = await channel.fetch_message(m.assignments_message_id)
-
-    if not m.pinged_once and ping_text:
-        await msg.edit(content=f"{ping_text}\n{content_without_ping}")
-        m.pinged_once = True
-    else:
-        await msg.edit(content=content_without_ping)
-
-def build_staff_ping_header(staff_role_id: Optional[int] = None) -> str:
-    if staff_role_id:
-        return f"<@&{staff_role_id}>"
-    return "@here"  # or "" if you don't want any ping
-
-
 def get_user_team_role(member: discord.Member) -> discord.Role | None:
-    """Return the team role for this member based ONLY on teams.json, or None."""
+    """Return the team role for this member based on teams.json,
+    falling back to scanning their roles with is_team_role()."""
+
     guild = member.guild
+
+    # --- 1) try teams.json (current behavior) ---
     try:
         teams = load_teams()
     except Exception:
@@ -653,8 +794,20 @@ def get_user_team_role(member: discord.Member) -> discord.Role | None:
         if r and r in member.roles:
             team_roles.append(r)
 
-    # If exactly one team role matches, return it; otherwise None
-    return team_roles[0] if len(team_roles) == 1 else None
+    if len(team_roles) == 1:
+        return team_roles[0]
+
+    # --- 2) fallback: infer from member.roles using is_team_role ---
+    inferred: list[discord.Role] = []
+    for r in member.roles:
+        if is_team_role(guild, r):
+            inferred.append(r)
+
+    return inferred[0] if len(inferred) == 1 else None
+
+
+
+
 
 
 def find_single_team_for_member(guild: discord.Guild, member: discord.Member) -> Optional[discord.Role]:
@@ -665,7 +818,9 @@ async def get_team_data(team_role: discord.Role, guild: discord.Guild):
     members = [m for m in guild.members if team_role in m.roles and not m.bot]
     captain = None
     co_captains = []
+    executives = []
     players = []
+
     for m in members:
         if has_role_id(m, CAPTAIN_ROLE_ID):
             if not captain:
@@ -675,6 +830,7 @@ async def get_team_data(team_role: discord.Role, guild: discord.Guild):
             co_captains.append(m)
             continue
         if has_role_id(m, TEAM_EXEC_ROLE_ID):
+            executives.append(m)
             continue
         players.append(m)
 
@@ -695,11 +851,15 @@ async def get_team_data(team_role: discord.Role, guild: discord.Guild):
             # user not found -> clean it out
             remove_pending_invite(team_role.id, uid)
 
+    # Keep old 'executive' key for backwards compatibility (first exec or "None set")
+    executive_single = executives[0].mention if executives else "None set"
+
     return {
         "name": team_role.name,
-        "executive": "None set",
+        "executive": executive_single,              # old single field
+        "executives": executives,                   # NEW: list[Member]
         "captain": captain.mention if captain else "None",
-        "co_captains": [m.mention for m in co_captains],
+        "co_captains": [m for m in co_captains],    # list[Member]
         "players": players,
         "pending_invites": pending_mentions,
     }
@@ -958,6 +1118,81 @@ class MainSettingsView(discord.ui.View):
 
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
+
+
+class DisbandTeamModal(discord.ui.Modal, title="Disband Team"):
+    team = discord.ui.TextInput(
+        label="Team (mention/name/id)",
+        required=True,
+        max_length=100,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            return
+
+        # resolve team role (mention, id, or name) using your existing helper
+        raw = self.team.value.strip()
+        team_role, _, _ = resolve_team_any(guild, raw)
+        if not isinstance(team_role, discord.Role):
+            await interaction.response.send_message("Could not find that team role.", ephemeral=True)
+            return
+
+        # safety: don't ever disband protected roles
+        protected = {
+            CAPTAIN_ROLE_ID, CO_CAPTAIN_ROLE_ID, TEAM_PLAYER_ROLE_ID, TEAM_EXEC_ROLE_ID,
+            HEAD_REF_ROLE_ID, REF_ROLE_ID, HEAD_CASTER_ROLE_ID, CASTER_ROLE_ID,
+            STREAM_WATCHER_ROLE_ID, UNBORN_CAPTAIN_ROLE_ID, EVENT_PING_ROLE_ID,
+        }
+        if team_role.id in protected or team_role.is_default() or team_role.managed:
+            await interaction.response.send_message("That role cannot be disbanded.", ephemeral=True)
+            return
+
+        tx_ch = guild.get_channel(TRANSACTIONS_CHANNEL_ID)
+
+        # Remove team role + global team roles from members
+        removed_members = 0
+        cap_role = guild.get_role(CAPTAIN_ROLE_ID)
+        co_role = guild.get_role(CO_CAPTAIN_ROLE_ID)
+        exec_role = guild.get_role(TEAM_EXEC_ROLE_ID)
+        player_role = guild.get_role(TEAM_PLAYER_ROLE_ID)
+
+        for m in list(guild.members):
+            if m.bot:
+                continue
+            if team_role in m.roles:
+                roles_to_remove = [team_role]
+                for r in (cap_role, co_role, exec_role, player_role):
+                    if r and r in m.roles:
+                        roles_to_remove.append(r)
+                try:
+                    await m.remove_roles(*roles_to_remove, reason=f"Manual disband via /admin-panel by {interaction.user}")
+                    removed_members += 1
+                except Exception:
+                    pass
+
+        # delete the team role
+        try:
+            await team_role.delete(reason=f"Manual disband via /admin-panel by {interaction.user}")
+        except Exception:
+            pass
+
+        # log to transactions
+        if isinstance(tx_ch, discord.TextChannel):
+            try:
+                await tx_ch.send(f"# {team_role.name} HAS BEEN DISBANDED\n\n")
+            except Exception:
+                pass
+
+        await interaction.response.send_message(
+            f"Disbanded **{team_role.name}** and removed team/global roles from {removed_members} member(s).",
+            ephemeral=True,
+        )
+
+
+
 # ---------------- Admin Panel Modals ----------------
 class CreateTeamModal(discord.ui.Modal, title="Create Team"):
     team_name = discord.ui.TextInput(label="Team Name", required=True)
@@ -971,41 +1206,51 @@ class CreateTeamModal(discord.ui.Modal, title="Create Team"):
             await interaction.response.send_message("Use this in a server.", ephemeral=True)
             return
 
+        # Defer early (we do role/emoji creation and HTTP)
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        except Exception:
+            pass
+
         tx = guild.get_channel(TRANSACTIONS_CHANNEL_ID)
+
+        # Resolve captain
         raw = self.captain.value.strip()
         if raw.startswith("<@") and raw.endswith(">"):
             raw = raw.strip("<@!>")
-        member = None
         try:
             member = await guild.fetch_member(int(raw))
         except Exception:
-            pass
+            member = None
         if member is None:
-            await interaction.response.send_message("Could not find that captain.", ephemeral=True)
+            await interaction.followup.send("Could not find that captain.", ephemeral=True)
             return
 
+        # Color
         c = self.color.value.strip()
         if not c.startswith("#"):
             c = "#" + c
         try:
             color_int = int(c[1:], 16)
         except Exception:
-            await interaction.response.send_message("Invalid color code.", ephemeral=True)
+            await interaction.followup.send("Invalid color code.", ephemeral=True)
             return
 
-        # create role
+        plain_team_name = self.team_name.value
+
+        # Create role with plain name only
         try:
             role = await guild.create_role(
-                name=self.team_name.value,
+                name=plain_team_name,
                 colour=discord.Colour(color_int),
                 reason=f"Team created by {interaction.user}",
             )
         except Exception as e:
             print(f"[CreateTeamModal] Failed to create role: {e}")
-            await interaction.response.send_message("Failed to create role (missing perms?).", ephemeral=True)
+            await interaction.followup.send("Failed to create role (missing perms?).", ephemeral=True)
             return
 
-        # move team role under Team Player role in the role list
+        # Move team role under Team Player role
         try:
             team_player_role = guild.get_role(TEAM_PLAYER_ROLE_ID)
             if team_player_role:
@@ -1014,25 +1259,25 @@ class CreateTeamModal(discord.ui.Modal, title="Create Team"):
         except Exception as e:
             print(f"[CreateTeamModal] Failed to move role {role} under Team Player: {e}")
 
-        # register team
-        add_team_to_list(role.id, role.name)
+        # Register in teams.json with plain name
+        add_team_to_list(role.id, plain_team_name)
 
-        # assign captain & team_player role
+        # Assign captain & team_player roles
         roles_to_add = [role]
         cap_role = guild.get_role(CAPTAIN_ROLE_ID)
         if cap_role:
             roles_to_add.append(cap_role)
-        team_player_role = guild.get_role(TEAM_PLAYER_ROLE_ID)
         if team_player_role and team_player_role not in roles_to_add:
             roles_to_add.append(team_player_role)
+
         try:
             await member.add_roles(*roles_to_add, reason="New team created by admin")
         except Exception as e:
             print(f"[CreateTeamModal] Failed to assign roles to captain: {e}")
-            await interaction.response.send_message("Team created but failed to assign roles.", ephemeral=True)
+            await interaction.followup.send("Team created but failed to assign roles.", ephemeral=True)
             return
 
-        # optional: process PFP URL
+        # optional: process PFP URL -> emoji + role icon, BUT keep role name plain
         pfp = (self.pfp_url.value or "").strip()
         created_emoji = None
         if pfp:
@@ -1042,31 +1287,316 @@ class CreateTeamModal(discord.ui.Modal, title="Create Team"):
                     async with sess.get(pfp, timeout=15) as resp:
                         if resp.status == 200:
                             data = await resp.read()
+
+                            # Try to create a custom emoji
+                            try:
+                                safe_name = re.sub(r"[^0-9A-Za-z_]", "_", plain_team_name)[:32] or "teamimg"
+                                created_emoji = await guild.create_custom_emoji(
+                                    name=safe_name,
+                                    image=data,
+                                    reason="Team pfp uploaded",
+                                )
+                            except Exception as e:
+                                print(f"[CreateTeamModal] Failed to create emoji: {e}")
+                                created_emoji = None
+
+                            # Try to set the role icon (if supported)
                             try:
                                 await role.edit(reason=f"Set team icon by {interaction.user}", icon=data)
-                            except Exception:
-                                try:
-                                    created_emoji = await guild.create_custom_emoji(
-                                        name=re.sub(r"[^0-9A-Za-z_]", "_", role.name)[:32],
-                                        image=data,
-                                        reason="Team pfp uploaded"
-                                    )
-                                except Exception:
-                                    created_emoji = None
-            except Exception:
+                            except Exception as e:
+                                print(f"[CreateTeamModal] Failed to set role icon: {e}")
+            except Exception as e:
+                print(f"[CreateTeamModal] Failed PFP handling: {e}")
                 created_emoji = None
 
-        # log and notify
+        # Log and notify
         if tx:
             try:
-                await tx.send(f"# New Team Created!\n* Team Name: {role.mention}\n* Team Captain: {member.mention}")
+                await tx.send(
+                    f"# New Team Created!\n"
+                    f"* Team Name: {role.mention}\n"
+                    f"* Team Captain: {member.mention}"
+                )
             except Exception:
                 pass
 
         msg_parts = [f"Team {role.mention} created and {member.mention} set as captain."]
         if created_emoji:
             msg_parts.append(f"Created emoji: {created_emoji}")
-        await interaction.response.send_message("\n".join(msg_parts), ephemeral=True)
+
+        await interaction.followup.send("\n".join(msg_parts), ephemeral=True)
+
+
+class AdminPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="roster lock all", style=discord.ButtonStyle.danger)
+    async def roster_lock_all(self, interaction, button):
+        global ROSTER_LOCKED
+        guild = interaction.guild
+        tx = guild.get_channel(TRANSACTIONS_CHANNEL_ID) if guild else None
+        ROSTER_LOCKED = True
+        if tx:
+            try:
+                await tx.send("# ROSTER LOCK HAS BEEN ENABLED FOR ALL TEAM!")
+            except Exception:
+                pass
+        await interaction.response.send_message("Rosters locked for all teams.", ephemeral=True)
+
+    @discord.ui.button(label="Disband team", style=discord.ButtonStyle.danger)
+    async def disband_team_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # admins only
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
+            return
+
+        await interaction.response.send_modal(DisbandTeamModal())
+
+
+    @discord.ui.button(label="disband all", style=discord.ButtonStyle.danger)
+    async def disband_all(self, interaction, button):
+        """
+        Disband ONLY teams that are registered in teams.json (load_teams).
+        Leaves all other server roles alone.
+        """
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        # 1) Load known team roles from teams.json
+        teams_data = load_teams()
+        team_role_ids: set[int] = set()
+        for entry in teams_data:
+            rid = entry.get("role_id")
+            if not rid:
+                continue
+            try:
+                team_role_ids.add(int(rid))
+            except (TypeError, ValueError):
+                continue
+
+        if not team_role_ids:
+            await interaction.followup.send("No teams found in teams.json; nothing to disband.", ephemeral=True)
+            return
+
+        # 2) Resolve actual Role objects for those IDs
+        team_roles: list[discord.Role] = []
+        for rid in team_role_ids:
+            r = guild.get_role(rid)
+            if r and not r.is_default() and not r.managed:
+                team_roles.append(r)
+
+        if not team_roles:
+            await interaction.followup.send("No valid team roles found on this server.", ephemeral=True)
+            return
+
+        # 3) Prepare global roles to strip only from members who had a team role
+        global_role_ids = {
+            CAPTAIN_ROLE_ID,
+            CO_CAPTAIN_ROLE_ID,
+            TEAM_PLAYER_ROLE_ID,
+            TEAM_EXEC_ROLE_ID,
+        }
+        global_roles = {rid: guild.get_role(rid) for rid in global_role_ids if rid}
+
+        # 4) For each member, if they have ANY team role -> remove team + global roles
+        for member in guild.members:
+            if member.bot:
+                continue
+            member_team_roles = [r for r in member.roles if r.id in team_role_ids]
+            if not member_team_roles:
+                continue
+
+            roles_to_remove = list(member_team_roles)
+            for r in global_roles.values():
+                if r and r in member.roles:
+                    roles_to_remove.append(r)
+
+            if roles_to_remove:
+                try:
+                    await member.remove_roles(
+                        *roles_to_remove,
+                        reason=f"Disband-all teams by {interaction.user}",
+                    )
+                except Exception:
+                    pass  # best-effort
+
+        # 5) Delete ONLY the team roles, leave all other roles intact
+        deleted_count = 0
+        for r in team_roles:
+            try:
+                await r.delete(reason=f"Disband-all teams by {interaction.user}")
+                deleted_count += 1
+            except Exception:
+                pass  # best-effort
+
+        # 6) Optional: clean teams.json (remove teams whose roles no longer exist)
+        cleaned: list[dict] = []
+        for entry in teams_data:
+            rid = entry.get("role_id")
+            if not rid:
+                continue
+            try:
+                rid_int = int(rid)
+            except (TypeError, ValueError):
+                continue
+            # keep only teams whose role still exists
+            if guild.get_role(rid_int) is not None:
+                cleaned.append(entry)
+        try:
+            with TEAMS_FILE.open("w", encoding="utf-8") as f:
+                json.dump(cleaned, f, indent=2)
+        except Exception:
+            pass
+
+        # 7) Log to transactions and reply
+        tx = guild.get_channel(TRANSACTIONS_CHANNEL_ID)
+        if isinstance(tx, discord.TextChannel):
+            try:
+                await tx.send("# ALL REGISTERED TEAMS HAVE BEEN DISBANDED")
+            except Exception:
+                pass
+
+        await interaction.followup.send(
+            f"Disbanded {deleted_count} team roles and stripped their members' team/global roles.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="add scrim", style=discord.ButtonStyle.primary)
+    async def add_scrim(self, interaction, button):
+        await interaction.response.send_modal(AddScrimModal())
+
+    @discord.ui.button(label="submit score", style=discord.ButtonStyle.success)
+    async def submit_score(self, interaction, button):
+        global SEEDING_OPEN
+        if SEEDING_OPEN:
+            await interaction.response.send_modal(SubmitScoreModalSeeding())
+        else:
+            await interaction.response.send_modal(SubmitScoreModalNoSeeding())
+
+    @discord.ui.button(label="submit time", style=discord.ButtonStyle.secondary)
+    async def submit_time(self, interaction, button):
+        await interaction.response.send_modal(SubmitTimeModal())
+
+    @discord.ui.button(label="create team", style=discord.ButtonStyle.primary)
+    async def create_team(self, interaction, button):
+        await interaction.response.send_modal(CreateTeamModal())
+
+    @discord.ui.button(label="Admin Add", style=discord.ButtonStyle.success)
+    async def admin_add(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AdminAddModal())
+
+    @discord.ui.button(label="Admin Kick", style=discord.ButtonStyle.danger)
+    async def admin_kick(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AdminKickModal())
+
+    @discord.ui.button(label="unlock roster all", style=discord.ButtonStyle.success)
+    async def unlock_roster_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+        global ROSTER_LOCKED
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            return
+
+        ROSTER_LOCKED = False
+        tx = guild.get_channel(TRANSACTIONS_CHANNEL_ID)
+        if isinstance(tx, discord.TextChannel):
+            try:
+                await tx.send("# ALL ROSTERS HAVE BEEN UNLOCKED BY AN ADMIN")
+            except Exception:
+                pass
+
+        await interaction.response.send_message("All rosters unlocked.", ephemeral=True)
+
+
+class AdminPanel(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    @app_commands.guilds(Object(id=TEST_GUILD_ID))
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.command(name="admin-panel", description="Open the admin panel.")
+    async def admin_panel(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("You do not have permission.", ephemeral=True)
+            return
+        await interaction.response.send_message("Admin Panel:", view=AdminPanelView(), ephemeral=True)
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        if not message.author.bot:
+            return
+        if message.channel.id != TRANSACTIONS_CHANNEL_ID:
+            return
+        content = message.content.strip()
+        if not content.lower().startswith("/create-team"):
+            return
+        guild = message.guild
+        if guild is None:
+            return
+        parts = content.split()
+        if len(parts) < 4:
+            return
+        raw_color = parts[-1]
+        raw_capt = parts[-2]
+        name = " ".join(parts[1:-2])
+        if raw_capt.startswith("<@") and raw_capt.endswith(">"):
+            raw_capt = raw_capt.strip("<@!>")
+        try:
+            capt = await guild.fetch_member(int(raw_capt))
+        except Exception:
+            capt = None
+        if capt is None:
+            return
+        c = raw_color
+        if not c.startswith("#"):
+            c = "#" + c
+        try:
+            color_int = int(c[1:], 16)
+        except Exception:
+            return
+        try:
+            role = await guild.create_role(
+                name=name,
+                colour=discord.Colour(color_int),
+                reason="Team created by apply-bot command"
+            )
+        except Exception as e:
+            print(f"[AdminPanel] Failed to create team role via /create-team: {e}")
+            return
+
+        # move team role under Team Player role in the role list
+        try:
+            team_player_role = guild.get_role(TEAM_PLAYER_ROLE_ID)
+            if team_player_role:
+                target_pos = max(team_player_role.position - 1, 1)
+                await role.edit(position=target_pos)
+        except Exception as e:
+            print(f"[AdminPanel] Failed to move role {role} under Team Player: {e}")
+
+        # register team in teams.json
+        add_team_to_list(role.id, role.name)
+
+        roles = [role]
+        cap_role = guild.get_role(CAPTAIN_ROLE_ID)
+        if cap_role:
+            roles.append(cap_role)
+        try:
+            await capt.add_roles(*roles, reason="New team created via /create-team")
+        except Exception as e:
+            print(f"[AdminPanel] Failed to assign roles to captain via /create-team: {e}")
+        tx = guild.get_channel(TRANSACTIONS_CHANNEL_ID)
+        if tx:
+            try:
+                await tx.send(f"# New Team Created!\n* Team Name: {role.mention}\n* Team Captain: {capt.mention}")
+            except Exception:
+                pass
+
+
 
 class SubmitScoreModalSeeding(discord.ui.Modal, title="Submit Score"):
     winner = discord.ui.TextInput(label="Winner (team name)", required=True)
@@ -1271,8 +1801,8 @@ class AddScrimModal(discord.ui.Modal, title="Add Scrim"):
                 f"# Welcome to PGL Bracket\n"
                 f"> 🗓️ You guys will have 3 day to schedule\n"
                 f"> ⚔️ And 4 days to play\n"
-                f"> Ping a staff member when you're ready to schedule or have any questions!"
-                f"> Do `/forfeit` if you want to forfeit this scrim"
+                f"> Ping a staff member when you're ready to schedule or have any questions!\n"
+                f"> Do `/forfeit` if you are unable to play your match"
             )
 
         await ch.send(msg)
@@ -1350,7 +1880,7 @@ class AdminAddModal(discord.ui.Modal, title="Admin Add Player"):
 class AutoCodeCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.state = load_codes_state()  # {str(message_id): {"code": PGL1234", "time": "..."}}
+        self.state = load_codes_state()  # {str(message_id): {"code": "PGL1234", "time": "..."}}
         self.check_matches.start()
 
     def cog_unload(self):
@@ -1536,7 +2066,6 @@ class AutoCodeCog(commands.Cog):
         return ff_str + " EST"
 
 
-
     def _resolve_member_from_mention(self, guild: discord.Guild, mention: str) -> Optional[discord.Member]:
         if not mention:
             return None
@@ -1658,6 +2187,64 @@ class AutoCodeCog(commands.Cog):
         await self.bot.wait_until_ready()
 
 
+from datetime import datetime, timedelta, timezone  # make sure timezone is imported
+
+EST_TZ = timezone(timedelta(hours=-5))
+
+def parse_time_to_unix_est(time_str: str) -> int | None:
+    """
+    Parse strings like:
+      '1/17 at 8PM EST'
+      '6/25/26 at 8PM EST'
+      '6/25 at 8:10PM EST'
+      '6/25/26 at 8:10PM EST'
+    into a UNIX timestamp, assuming the time is EST.
+    """
+    if not time_str or " at " not in time_str:
+        return None
+
+    date_part, time_part = time_str.split(" at ", 1)
+    date_part = date_part.strip()
+    time_part = time_part.strip()
+
+    # Strip timezone words
+    for tz_word in ("EST", "EDT", "est", "edt"):
+        time_part = time_part.replace(tz_word, "")
+    time_part = time_part.strip()
+
+    # Handle missing year -> use current year
+    parts = date_part.split("/")
+    if len(parts) == 2:
+        m, d = parts
+        try:
+            year_now = datetime.now().year
+            date_part_full = f"{int(m)}/{int(d)}/{year_now}"
+        except Exception:
+            return None
+    else:
+        date_part_full = date_part
+
+    fmts = [
+        "%m/%d/%y %I%p",
+        "%m/%d/%Y %I%p",
+        "%m/%d/%y %I:%M%p",
+        "%m/%d/%Y %I:%M%p",
+    ]
+
+    dt_est = None
+    for fmt in fmts:
+        try:
+            dt_est = datetime.strptime(f"{date_part_full} {time_part}", fmt)
+            break
+        except Exception:
+            continue
+
+    if dt_est is None:
+        return None
+
+    # Attach EST timezone so .timestamp() is correct
+    dt_est = dt_est.replace(tzinfo=EST_TZ)
+    return int(dt_est.timestamp())
 
 
 
@@ -1666,49 +2253,62 @@ class LeaveCog(commands.Cog):
         self.bot = bot
 
     @app_commands.guilds(Object(id=TEST_GUILD_ID))
-    @app_commands.command(name="leave", description="Leave your team (players, co-captains, executives).")
+    @app_commands.command(
+        name="leave",
+        description="Leave your team (players, co-captains, executives, captains).",
+    )
     async def leave(self, interaction: discord.Interaction):
         guild = interaction.guild
         if guild is None:
-            await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            await interaction.response.send_message(
+                "Use this in a server.",
+                ephemeral=True,
+            )
             return
 
-        # resolve member object
+        # resolve member
         try:
             member = guild.get_member(interaction.user.id) or await guild.fetch_member(interaction.user.id)
         except Exception:
             member = None
 
         if member is None:
-            await interaction.response.send_message("Could not resolve your member object.", ephemeral=True)
+            await interaction.response.send_message(
+                "Could not resolve your member object.",
+                ephemeral=True,
+            )
             return
 
-        team_role = get_user_team_role(member)
+        # find team role ONLY from teams.json (using helper)
+        team_role = find_member_team_role(member)
         if team_role is None:
-            await interaction.response.send_message("You are not on a team.", ephemeral=True)
+            await interaction.response.send_message(
+                "You are not on a team.",
+                ephemeral=True,
+            )
             return
 
-        # check roles eligibility
         is_captain = has_role_id(member, CAPTAIN_ROLE_ID)
         is_co = has_role_id(member, CO_CAPTAIN_ROLE_ID)
         is_exec = has_role_id(member, TEAM_EXEC_ROLE_ID)
         is_player = has_role_id(member, TEAM_PLAYER_ROLE_ID)
 
         if not (is_player or is_co or is_exec or is_captain):
-            await interaction.response.send_message("Only players, co-captains, executives, or captains may use this command.", ephemeral=True)
+            await interaction.response.send_message(
+                "Only players, co-captains, executives, or captains may use this command.",
+                ephemeral=True,
+            )
             return
 
-        # If captain, require transfer or disallow if no candidates
+        # -------- captain case: must transfer captain first --------
         if is_captain:
-            # build candidate list: co-captains or executives who share the team_role
-            candidates = []
+            candidates: list[discord.Member] = []
             for m in guild.members:
                 if m.bot:
                     continue
                 if team_role not in m.roles:
                     continue
                 if has_role_id(m, CO_CAPTAIN_ROLE_ID) or has_role_id(m, TEAM_EXEC_ROLE_ID):
-                    # exclude the leaving captain
                     if m.id == member.id:
                         continue
                     candidates.append(m)
@@ -1717,40 +2317,65 @@ class LeaveCog(commands.Cog):
 
             if not candidates:
                 await interaction.response.send_message(
-                    "You are the captain and there are no co-captains/executives to transfer to. Please transfer captain to someone or disband the team before leaving.",
+                    "You are the captain and there are no co-captains/executives to transfer to.\n"
+                    "Please transfer captain to someone or disband the team before leaving.",
                     ephemeral=True,
                 )
                 return
 
-            # present select to choose new captain
-            options = [discord.SelectOption(label=c.display_name, description=f"{c.name}#{c.discriminator}", value=str(c.id)) for c in candidates]
-            select = discord.ui.Select(placeholder="Select a new captain", options=options, min_values=1, max_values=1)
+            options = [
+                discord.SelectOption(
+                    label=c.display_name,
+                    description=f"{c.name}#{c.discriminator}",
+                    value=str(c.id),
+                )
+                for c in candidates
+            ]
+            select = discord.ui.Select(
+                placeholder="Select a new captain",
+                options=options,
+                min_values=1,
+                max_values=1,
+            )
 
             async def sel_cb(sel_int: discord.Interaction):
                 new_id = int(sel_int.data["values"][0])
                 new_member = guild.get_member(new_id)
                 if new_member is None:
-                    await sel_int.response.send_message("Selected member not found.", ephemeral=True)
+                    await sel_int.response.send_message(
+                        "Selected member not found.",
+                        ephemeral=True,
+                    )
                     return
 
                 cap_role = guild.get_role(CAPTAIN_ROLE_ID)
                 if cap_role is None:
-                    await sel_int.response.send_message("Captain role not configured on this server.", ephemeral=True)
+                    await sel_int.response.send_message(
+                        "Captain role not configured on this server.",
+                        ephemeral=True,
+                    )
                     return
 
-                # perform transfer
+                # transfer captain
                 try:
-                    # remove captain role from leaving member
                     if cap_role in member.roles:
-                        await member.remove_roles(cap_role, reason=f"Transferred captain via /leave by {member}")
-                    # add captain role to new member
-                    await new_member.add_roles(cap_role, reason=f"Promoted to captain by {member} via /leave")
+                        await member.remove_roles(
+                            cap_role,
+                            reason=f"Transferred captain via /leave by {member}",
+                        )
+                    await new_member.add_roles(
+                        cap_role,
+                        reason=f"Promoted to captain by {member} via /leave",
+                    )
                 except Exception:
-                    await sel_int.response.send_message("Failed to transfer captain role (missing Manage Roles?).", ephemeral=True)
+                    await sel_int.response.send_message(
+                        "Failed to transfer captain role (missing Manage Roles?).",
+                        ephemeral=True,
+                    )
                     return
 
-                # now remove leaver's team + relevant global roles
-                roles_to_remove = []
+                # now remove leaver's team + global roles
+                roles_to_remove: list[discord.Role] = []
                 if team_role in member.roles:
                     roles_to_remove.append(team_role)
                 for rid in (CO_CAPTAIN_ROLE_ID, TEAM_EXEC_ROLE_ID, TEAM_PLAYER_ROLE_ID):
@@ -1760,12 +2385,18 @@ class LeaveCog(commands.Cog):
 
                 try:
                     if roles_to_remove:
-                        await member.remove_roles(*roles_to_remove, reason=f"Left team via /leave by {member}")
+                        await member.remove_roles(
+                            *roles_to_remove,
+                            reason=f"Left team via /leave by {member}",
+                        )
                 except Exception:
-                    await sel_int.response.send_message("Transferred captain but failed to remove some roles from you (missing perms?).", ephemeral=True)
+                    await sel_int.response.send_message(
+                        "Transferred captain but failed to remove some roles from you (missing perms?).",
+                        ephemeral=True,
+                    )
                     return
 
-                # notify transactions
+                # log
                 try:
                     tx = guild.get_channel(TRANSACTIONS_CHANNEL_ID)
                     if isinstance(tx, discord.TextChannel):
@@ -1773,16 +2404,23 @@ class LeaveCog(commands.Cog):
                 except Exception:
                     pass
 
-                await sel_int.response.send_message(f"Captain transferred to {new_member.mention} and you have left {team_role.name}.", ephemeral=True)
+                await sel_int.response.send_message(
+                    f"Captain transferred to {new_member.mention} and you have left {team_role.name}.",
+                    ephemeral=True,
+                )
 
             select.callback = sel_cb
             view = discord.ui.View(timeout=60)
             view.add_item(select)
-            await interaction.response.send_message("You are the captain. Select a new captain to transfer to before leaving:", view=view, ephemeral=True)
+            await interaction.response.send_message(
+                "You are the captain. Select a new captain to transfer to before leaving:",
+                view=view,
+                ephemeral=True,
+            )
             return
 
-        # Not a captain — proceed to remove roles
-        roles_to_remove = []
+        # -------- non-captain: just remove roles --------
+        roles_to_remove: list[discord.Role] = []
         if team_role in member.roles:
             roles_to_remove.append(team_role)
         for rid in (CO_CAPTAIN_ROLE_ID, TEAM_EXEC_ROLE_ID, TEAM_PLAYER_ROLE_ID):
@@ -1792,12 +2430,18 @@ class LeaveCog(commands.Cog):
 
         try:
             if roles_to_remove:
-                await member.remove_roles(*roles_to_remove, reason=f"Left team via /leave by {member}")
+                await member.remove_roles(
+                    *roles_to_remove,
+                    reason=f"Left team via /leave by {member}",
+                )
         except Exception:
-            await interaction.response.send_message("Failed to remove roles (missing Manage Roles permission?). Contact staff.", ephemeral=True)
+            await interaction.response.send_message(
+                "Failed to remove roles (missing Manage Roles permission?). Contact staff.",
+                ephemeral=True,
+            )
             return
 
-        # notify transactions channel
+        # log
         try:
             tx = guild.get_channel(TRANSACTIONS_CHANNEL_ID)
             if isinstance(tx, discord.TextChannel):
@@ -1805,7 +2449,10 @@ class LeaveCog(commands.Cog):
         except Exception:
             pass
 
-        await interaction.response.send_message(f"You have left {team_role.name}.", ephemeral=True)
+        await interaction.response.send_message(
+            f"You have left {team_role.name}.",
+            ephemeral=True,
+        )
 
 
 
@@ -2094,6 +2741,7 @@ class InviteUserSelect(discord.ui.UserSelect):
             await interaction.response.send_message("Invalid selection.", ephemeral=True)
             return
 
+        # We only care about real guild members for team checks
         if isinstance(target, discord.Member):
             if target.bot:
                 await interaction.response.send_message("You cannot invite a bot.", ephemeral=True)
@@ -2107,14 +2755,44 @@ class InviteUserSelect(discord.ui.UserSelect):
                 )
                 return
 
-            # Already on *any* team
-            existing_team = get_user_team_role(target)
-            if existing_team is not None:
+            # ---------- STRICT 'already on a team' check (local, no helper) ----------
+            # Load team role IDs from teams.json
+            try:
+                teams_data = load_teams()
+            except Exception:
+                teams_data = []
+
+            team_ids_from_file: set[int] = set()
+            for entry in teams_data:
+                rid = entry.get("role_id")
+                if not rid:
+                    continue
+                try:
+                    team_ids_from_file.add(int(rid))
+                except (TypeError, ValueError):
+                    continue
+
+            def is_fake_team_role(r: discord.Role) -> bool:
+                name = (r.name or "").strip().lower()
+                if "team roles" in name:
+                    return True
+                if name and all(ch in "-—_ " for ch in name):
+                    return True
+                return False
+
+            already_on_team = False
+            for r in target.roles:
+                if r.id in team_ids_from_file and not is_fake_team_role(r):
+                    already_on_team = True
+                    break
+
+            if already_on_team:
                 await interaction.response.send_message(
                     f"{target.mention} is already on a team.",
                     ephemeral=True,
                 )
                 return
+            # -----------------------------------------------------------------
 
         team_role = self.parent_view.team_role
         team_name = team_role.name
@@ -2134,10 +2812,8 @@ class InviteUserSelect(discord.ui.UserSelect):
 
             @discord.ui.button(label="Accept", style=discord.ButtonStyle.success)
             async def accept(self, intr: discord.Interaction, btn: discord.ui.Button):
-                # We are in DMs, so intr.guild is None. Use the team role's guild.
                 guild = team_role.guild
 
-                # get member in that guild
                 member_obj = guild.get_member(self.target.id)
                 if member_obj is None:
                     try:
@@ -2155,7 +2831,6 @@ class InviteUserSelect(discord.ui.UserSelect):
                         pass
                     return
 
-                # add team role + TEAM_PLAYER_ROLE
                 roles_to_add = [team_role]
                 team_player_role = guild.get_role(TEAM_PLAYER_ROLE_ID)
                 if team_player_role and team_player_role not in roles_to_add:
@@ -2167,10 +2842,12 @@ class InviteUserSelect(discord.ui.UserSelect):
                         reason=f"Accepted invite to {team_name}",
                     )
                 except Exception:
-                    # even if role add fails, still try to update the UI
                     pass
 
-                # disable buttons on the original DM message
+                # remove pending invite record
+                remove_pending_invite(team_role.id, self.target.id)
+
+                # disable buttons
                 for child in self.children:
                     if isinstance(child, discord.ui.Button):
                         child.disabled = True
@@ -2179,17 +2856,14 @@ class InviteUserSelect(discord.ui.UserSelect):
                 except Exception:
                     pass
 
-                # reply to that same DM message with confirmation
                 try:
                     await intr.message.reply(f"You joined {team_name}!")
                 except Exception:
-                    # fallback if reply fails
                     try:
                         await intr.followup.send(f"You joined {team_name}!")
                     except Exception:
                         pass
 
-                # transactions: "@user Has Joined **Team**"
                 try:
                     tx_ch = guild.get_channel(TRANSACTIONS_CHANNEL_ID)
                     if isinstance(tx_ch, discord.TextChannel):
@@ -2201,7 +2875,6 @@ class InviteUserSelect(discord.ui.UserSelect):
 
             @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger)
             async def decline(self, intr: discord.Interaction, btn: discord.ui.Button):
-                # disable buttons when declined
                 for child in self.children:
                     if isinstance(child, discord.ui.Button):
                         child.disabled = True
@@ -2209,6 +2882,10 @@ class InviteUserSelect(discord.ui.UserSelect):
                     await intr.message.edit(view=self)
                 except Exception:
                     pass
+
+                # remove pending invite record
+                remove_pending_invite(team_role.id, self.target.id)
+
                 try:
                     await intr.response.send_message("You declined the invite.", ephemeral=True)
                 except Exception:
@@ -2217,23 +2894,22 @@ class InviteUserSelect(discord.ui.UserSelect):
 
         invite_accept_view = InviteAcceptView(target)
 
-        # Build DM embed
-        # Color: use team role's color (from its hex); fallback to blurple
         embed_color = team_role.colour or discord.Color.blurple()
         embed = discord.Embed(
             title=f"You've been invited to {team_name}",
             description=f"{captain_disp} invited you to join {team_name}. Use the buttons below to respond.",
             color=embed_color,
         )
-
-        # If the team has a role icon, show it as thumbnail
         if getattr(team_role, "icon", None):
             embed.set_thumbnail(url=team_role.icon.url)
+
+        # record pending invite
+        add_pending_invite(team_role.id, target.id)
 
         try:
             await target.send(embed=embed, view=invite_accept_view)
             await interaction.response.send_message(
-                f"Tell {target.mention} to check their DMs with the bot",
+                f"Tell {target.mention} to check their DMs with the bot.",
                 ephemeral=True,
             )
         except Exception:
@@ -2241,8 +2917,6 @@ class InviteUserSelect(discord.ui.UserSelect):
                 "Failed to DM that user (they may have DMs off or blocked the bot).",
                 ephemeral=True,
             )
-
-
 
 
 class ManageTeamView(discord.ui.View):
@@ -2261,37 +2935,87 @@ class ManageTeamView(discord.ui.View):
         self.invoker_id = invoker_id
         self.admin_override = admin_override
         self.players = players
+        self._roster_locked = roster_locked
 
-        # member select for kick/promote/assign/transfer
         if players:
             member_select = discord.ui.Select(
                 placeholder="Select member",
                 min_values=1,
                 max_values=1,
-                options=[discord.SelectOption(label=p.display_name, value=str(p.id)) for p in players][:25],
-                custom_id=f"mt:{team_role.id}:member"
+                options=[
+                    discord.SelectOption(label=p.display_name, value=str(p.id))
+                    for p in players
+                ][:25],
+                custom_id=f"mt:{team_role.id}:member",
             )
 
             async def member_cb(sel_inter: discord.Interaction, *, _select=member_select):
-                if self.invoker_id and not self.admin_override and sel_inter.user.id != self.invoker_id:
-                    await sel_inter.response.send_message("This panel is not for you.", ephemeral=True)
+                if (
+                    self.invoker_id
+                    and not self.admin_override
+                    and sel_inter.user.id != self.invoker_id
+                ):
+                    await sel_inter.response.send_message(
+                        "This panel is not for you.", ephemeral=True
+                    )
                     return
+
                 target_id = int(sel_inter.data["values"][0])
                 SELECTED_MEMBER_CACHE[(sel_inter.user.id, self.team_role.id)] = target_id
-                await sel_inter.response.send_message("Member selected. You can now use Kick / Promote / Assign Exec / Transfer Captain.", ephemeral=True)
+
+                # find the selected member object, if possible
+                sel_member = None
+                if sel_inter.guild:
+                    sel_member = sel_inter.guild.get_member(target_id)
+
+                # enable the four action buttons
+                self._set_action_buttons_enabled(True)
+
+                # edit the original manage-team message with updated view
+                await sel_inter.response.edit_message(view=self)
+
+                # send a small ephemeral note with the selected member's name
+                if sel_member is not None:
+                    note = (
+                        f"Selected **{sel_member.display_name}**. "
+                        "You can now use Kick / Promote / Assign Exec / Transfer Captain for them."
+                    )
+                else:
+                    note = (
+                        "Member selected. "
+                        "You can now use Kick / Promote / Assign Exec / Transfer Captain."
+                    )
+
+                try:
+                    await sel_inter.followup.send(note, ephemeral=True)
+                except Exception:
+                    pass
 
             member_select.callback = member_cb
             self.add_item(member_select)
 
+        # start with the four action buttons disabled
+        self._set_action_buttons_enabled(False)
 
-        # If roster is locked, disable buttons for normal users.
-        # Admin override (from /admin-manage) still keeps full control.
-        if roster_locked and not self.admin_override:
-            for child in list(self.children):
-                if isinstance(child, discord.ui.Button):
-                    if child.label == "Edit Team Info":
-                        continue
-                    child.disabled = True
+    def _set_action_buttons_enabled(self, enabled: bool):
+        """
+        Enable/disable ONLY these four buttons:
+        - Kick member
+        - Promote to co-captain
+        - Assign executive
+        - Transfer captain
+
+        Invite, Disband, Edit Team Info are never touched here.
+        """
+        target_labels = {
+            "Kick member",
+            "Promote to co-captain",
+            "Assign executive",
+            "Transfer captain",
+        }
+        for child in self.children:
+            if isinstance(child, discord.ui.Button) and child.label in target_labels:
+                child.disabled = not enabled
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if self.invoker_id and not self.admin_override:
@@ -2309,8 +3033,11 @@ class ManageTeamView(discord.ui.View):
         except Exception:
             pass
 
+    # ----------------- BUTTONS -----------------
+
     @discord.ui.button(label="Invite", style=discord.ButtonStyle.success, custom_id="mt_invite_button")
     async def invite_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # ALWAYS enabled
         if self.invoker_id and not self.admin_override and interaction.user.id != self.invoker_id:
             await interaction.response.send_message("This panel is not for you.", ephemeral=True)
             return
@@ -2320,7 +3047,6 @@ class ManageTeamView(discord.ui.View):
             await interaction.response.send_message("Use this in a server.", ephemeral=True)
             return
 
-        # Use a UserSelect dropdown (like your /invite example)
         view = discord.ui.View(timeout=60)
         view.add_item(InviteUserSelect(parent_view=self, invoker_id=interaction.user.id))
 
@@ -2332,34 +3058,53 @@ class ManageTeamView(discord.ui.View):
 
     @discord.ui.button(label="Kick member", style=discord.ButtonStyle.danger, custom_id="mt_kick_button")
     async def kick_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # starts disabled until member selected
         if self.invoker_id and not self.admin_override and interaction.user.id != self.invoker_id:
             await interaction.response.send_message("This panel is not for you.", ephemeral=True)
             return
+
         sel_id = self._get_selected_member(interaction.user.id)
         if not sel_id:
-            await interaction.response.send_message("No member selected. Use the dropdown to select a member first.", ephemeral=True)
+            await interaction.response.send_message(
+                "No member selected. Use the dropdown to select a member first.",
+                ephemeral=True,
+            )
             return
+
         guild = interaction.guild
         if guild is None:
             await interaction.response.send_message("Use in server.", ephemeral=True)
             return
+
         member = guild.get_member(sel_id)
         if member is None:
             await interaction.response.send_message("Member not found.", ephemeral=True)
             return
+
         roles_to_remove = []
         if self.team_role in member.roles:
             roles_to_remove.append(self.team_role)
         team_player_role = guild.get_role(TEAM_PLAYER_ROLE_ID)
         if team_player_role and team_player_role in member.roles:
             roles_to_remove.append(team_player_role)
+
         try:
             if roles_to_remove:
-                await member.remove_roles(*roles_to_remove, reason=f"Kicked from {self.team_role.name} by {interaction.user}")
+                await member.remove_roles(
+                    *roles_to_remove,
+                    reason=f"Kicked from {self.team_role.name} by {interaction.user}",
+                )
         except Exception:
-            await interaction.response.send_message("Failed to remove roles (missing perms?).", ephemeral=True)
+            await interaction.response.send_message(
+                "Failed to remove roles (missing perms?).",
+                ephemeral=True,
+            )
             return
-        await interaction.response.send_message(f"{member.mention} kicked from {self.team_role.mention}.", ephemeral=True)
+
+        await interaction.response.send_message(
+            f"{member.mention} kicked from {self.team_role.mention}.",
+            ephemeral=True,
+        )
         await self._tx(guild, f"{member.mention} Has Been kicked from **{self.team_role.name}**")
 
     @discord.ui.button(label="Promote to co-captain", style=discord.ButtonStyle.primary, custom_id="mt_promote_co_button")
@@ -2367,53 +3112,98 @@ class ManageTeamView(discord.ui.View):
         if self.invoker_id and not self.admin_override and interaction.user.id != self.invoker_id:
             await interaction.response.send_message("This panel is not for you.", ephemeral=True)
             return
+
         sel_id = self._get_selected_member(interaction.user.id)
         if not sel_id:
-            await interaction.response.send_message("No member selected. Use the dropdown to select a member first.", ephemeral=True)
+            await interaction.response.send_message(
+                "No member selected. Use the dropdown to select a member first.",
+                ephemeral=True,
+            )
             return
+
         guild = interaction.guild
         member = guild.get_member(sel_id) if guild else None
         if member is None:
             await interaction.response.send_message("Member not found.", ephemeral=True)
             return
+
         co_role = guild.get_role(CO_CAPTAIN_ROLE_ID)
         if co_role is None:
             await interaction.response.send_message("Co-captain role not configured.", ephemeral=True)
             return
+
+        # Count existing co-captains on this team
+        current_cos = [
+            m for m in guild.members
+            if not m.bot and self.team_role in m.roles and has_role_id(m, CO_CAPTAIN_ROLE_ID)
+        ]
+        if len(current_cos) >= MAX_CO_CAPTAINS and not self.admin_override:
+            await interaction.response.send_message(
+                f"This team already has {len(current_cos)} co-captains (max {MAX_CO_CAPTAINS}).",
+                ephemeral=True,
+            )
+            return
+
         try:
             await member.add_roles(co_role, reason=f"Promoted to co-captain by {interaction.user}")
             await interaction.response.send_message(f"{member.mention} promoted to co-captain.", ephemeral=True)
             await self._tx(guild, f"{member.mention} Has Been Promoted to Co-captain")
         except Exception:
-            await interaction.response.send_message("Failed to add co-captain role (missing perms?).", ephemeral=True)
+            await interaction.response.send_message(
+                "Failed to add co-captain role (missing perms?).",
+                ephemeral=True,
+            )
 
     @discord.ui.button(label="Assign executive", style=discord.ButtonStyle.primary, custom_id="mt_assign_exec_button")
     async def assign_exec(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.invoker_id and not self.admin_override and interaction.user.id != self.invoker_id:
             await interaction.response.send_message("This panel is not for you.", ephemeral=True)
             return
+
         sel_id = self._get_selected_member(interaction.user.id)
         if not sel_id:
-            await interaction.response.send_message("No member selected. Use the dropdown to select a member first.", ephemeral=True)
+            await interaction.response.send_message(
+                "No member selected. Use the dropdown to select a member first.",
+                ephemeral=True,
+            )
             return
+
         guild = interaction.guild
         member = guild.get_member(sel_id) if guild else None
         if member is None:
             await interaction.response.send_message("Member not found.", ephemeral=True)
             return
+
         exec_role = guild.get_role(TEAM_EXEC_ROLE_ID)
         if exec_role is None:
             await interaction.response.send_message("Team executive role not configured.", ephemeral=True)
             return
+
+        # Count existing executives on this team
+        current_execs = [
+            m for m in guild.members
+            if not m.bot and self.team_role in m.roles and has_role_id(m, TEAM_EXEC_ROLE_ID)
+        ]
+        if len(current_execs) >= MAX_EXECUTIVES and not self.admin_override:
+            await interaction.response.send_message(
+                f"This team already has {len(current_execs)} executives (max {MAX_EXECUTIVES}).",
+                ephemeral=True,
+            )
+            return
+
         try:
             await member.add_roles(exec_role, reason=f"Assigned executive by {interaction.user}")
             await interaction.response.send_message(f"{member.mention} assigned as team executive.", ephemeral=True)
             await self._tx(guild, f"{member.mention} Has Been Promoted to Team executive")
         except Exception:
-            await interaction.response.send_message("Failed to add executive role (missing perms?).", ephemeral=True)
+            await interaction.response.send_message(
+                "Failed to add executive role (missing perms?).",
+                ephemeral=True,
+            )
 
     @discord.ui.button(label="Transfer captain", style=discord.ButtonStyle.danger, custom_id="mt_transfer_captain_button")
     async def transfer_captain(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # starts disabled until member selected
         if self.invoker_id and not self.admin_override and interaction.user.id != self.invoker_id:
             await interaction.response.send_message("This panel is not for you.", ephemeral=True)
             return
@@ -2423,7 +3213,6 @@ class ManageTeamView(discord.ui.View):
             await interaction.response.send_message("Use in server.", ephemeral=True)
             return
 
-        # Build candidates: co-captains and executives on this team
         candidates = []
         for m in guild.members:
             if m.bot:
@@ -2436,10 +3225,18 @@ class ManageTeamView(discord.ui.View):
                     break
 
         if not candidates:
-            await interaction.response.send_message("No co-captain/executive candidates available to transfer to.", ephemeral=True)
+            await interaction.response.send_message(
+                "No co-captain/executive candidates available to transfer to.",
+                ephemeral=True,
+            )
             return
 
-        sel = discord.ui.Select(placeholder="Select new captain", options=candidates, min_values=1, max_values=1)
+        sel = discord.ui.Select(
+            placeholder="Select new captain",
+            options=candidates,
+            min_values=1,
+            max_values=1,
+        )
 
         async def sel_cb(sel_int: discord.Interaction):
             new_id = int(sel_int.data["values"][0])
@@ -2448,7 +3245,6 @@ class ManageTeamView(discord.ui.View):
                 await sel_int.response.send_message("Member not found.", ephemeral=True)
                 return
 
-            # find current captain (first one)
             old_capt = None
             for m in guild.members:
                 if self.team_role in m.roles and has_role_id(m, CAPTAIN_ROLE_ID):
@@ -2462,23 +3258,39 @@ class ManageTeamView(discord.ui.View):
 
             try:
                 if old_capt and cap_role in old_capt.roles:
-                    await old_capt.remove_roles(cap_role, reason=f"Transferred captain to {new_member}")
-                await new_member.add_roles(cap_role, reason=f"Promoted to captain for {self.team_role.name} by {sel_int.user}")
+                    await old_capt.remove_roles(
+                        cap_role,
+                        reason=f"Transferred captain to {new_member}",
+                    )
+                await new_member.add_roles(
+                    cap_role,
+                    reason=f"Promoted to captain for {self.team_role.name} by {sel_int.user}",
+                )
             except Exception:
-                await sel_int.response.send_message("Failed to transfer captain role (missing perms?).", ephemeral=True)
+                await sel_int.response.send_message(
+                    "Failed to transfer captain role (missing perms?).",
+                    ephemeral=True,
+                )
                 return
 
             await sel_int.response.send_message("Captain transferred.", ephemeral=True)
             old_disp = old_capt.mention if old_capt else "None"
-            await self._tx(guild, f"# {self.team_role.name} HAS CHANGED THERE CAPTAIN\n***• Old Captain: {old_disp} New Captain: {new_member.mention} ***")
+            await self._tx(
+                guild,
+                f"# {self.team_role.name} HAS CHANGED THERE CAPTAIN\n"
+                f"***• Old Captain: {old_disp} New Captain: {new_member.mention} ***",
+            )
 
         sel.callback = sel_cb
         v = discord.ui.View(timeout=60)
         v.add_item(sel)
-        await interaction.response.send_message("Select new captain:", view=v, ephemeral=True)
+        await interaction.response.send_message(
+            "Select new captain:", view=v, ephemeral=True
+        )
 
     @discord.ui.button(label="Disband", style=discord.ButtonStyle.danger, custom_id="mt_disband_button")
     async def disband_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # ALWAYS enabled (subject to invoker/admin check)
         if self.invoker_id and not self.admin_override and interaction.user.id != self.invoker_id:
             await interaction.response.send_message("This panel is not for you.", ephemeral=True)
             return
@@ -2490,12 +3302,12 @@ class ManageTeamView(discord.ui.View):
             if guild is None:
                 await i.response.send_message("Guild not found.", ephemeral=True)
                 return
-            # delete team role
+
             try:
                 await self.team_role.delete(reason=f"Disbanded by {i.user}")
             except Exception:
                 pass
-            # remove team role and team player from members
+
             team_player_role = guild.get_role(TEAM_PLAYER_ROLE_ID)
             for m in list(guild.members):
                 if self.team_role in m.roles:
@@ -2506,6 +3318,7 @@ class ManageTeamView(discord.ui.View):
                         await m.remove_roles(*to_remove, reason="Team disbanded")
                     except Exception:
                         pass
+
             await i.response.send_message("Team disbanded.", ephemeral=True)
             await self._tx(guild, f"# {self.team_role.name} HAS BEEN DISBANDED\n\n")
             confirm_view.stop()
@@ -2520,21 +3333,49 @@ class ManageTeamView(discord.ui.View):
         no.callback = no_cb
         confirm_view.add_item(yes)
         confirm_view.add_item(no)
-        await interaction.response.send_message("Are you sure you want to disband your team?", view=confirm_view, ephemeral=True)
+
+        await interaction.response.send_message(
+            "Are you sure you want to disband your team?",
+            view=confirm_view,
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="Edit Team Info", style=discord.ButtonStyle.secondary, custom_id="mt_edit_button")
     async def edit_info(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # ALWAYS enabled (subject to invoker/admin check)
         if self.invoker_id and not self.admin_override and interaction.user.id != self.invoker_id:
             await interaction.response.send_message("This panel is not for you.", ephemeral=True)
             return
 
-        options = []
-        options.append(discord.SelectOption(label="Team Profile Picture", description="Set a profile picture (URL).", value="pfp"))
+        options = [
+            discord.SelectOption(
+                label="Team Profile Picture",
+                description="Set a profile picture (URL).",
+                value="pfp",
+            )
+        ]
         if self.admin_override:
-            options.append(discord.SelectOption(label="Change Team Color", description="Update the team's color code in hex.", value="color"))
-            options.append(discord.SelectOption(label="Change Team Name", description="Rename the team and log the rebrand.", value="name"))
+            options.append(
+                discord.SelectOption(
+                    label="Change Team Color",
+                    description="Update the team's color code in hex.",
+                    value="color",
+                )
+            )
+            options.append(
+                discord.SelectOption(
+                    label="Change Team Name",
+                    description="Rename the team and log the rebrand.",
+                    value="name",
+                )
+            )
 
-        sel = discord.ui.Select(placeholder="Edit option", options=options, min_values=1, max_values=1)
+        sel = discord.ui.Select(
+            placeholder="Edit option",
+            options=options,
+            min_values=1,
+            max_values=1,
+        )
 
         async def sel_cb(sel_int: discord.Interaction):
             choice = sel_int.data["values"][0]
@@ -2542,20 +3383,43 @@ class ManageTeamView(discord.ui.View):
 
             if choice == "name":
                 class NameModal(discord.ui.Modal, title="Change Team Name"):
-                    new_name = discord.ui.TextInput(label="What is your new team's name?", required=True, max_length=100)
+                    new_name = discord.ui.TextInput(
+                        label="What is your new team's name?",
+                        required=True,
+                        max_length=100,
+                    )
+
                     async def on_submit(self, modal_inter: discord.Interaction):
                         old = self_view.team_role.name
                         try:
-                            await self_view.team_role.edit(name=self.new_name.value, reason=f"Team rename by {modal_inter.user}")
-                            await modal_inter.response.send_message(f"Team renamed to {self.new_name.value}.", ephemeral=True)
-                            await self_view._tx(modal_inter.guild, f"# TEAM HAS REBANED\n*** Old Name: {old} New Name: {self.new_name.value} ***")
+                            await self_view.team_role.edit(
+                                name=self.new_name.value,
+                                reason=f"Team rename by {modal_inter.user}",
+                            )
+                            await modal_inter.response.send_message(
+                                f"Team renamed to {self.new_name.value}.",
+                                ephemeral=True,
+                            )
+                            await self_view._tx(
+                                modal_inter.guild,
+                                f"# TEAM HAS REBANED\n*** Old Name: {old} New Name: {self.new_name.value} ***",
+                            )
                         except Exception:
-                            await modal_inter.response.send_message("Failed to rename team (missing perms?).", ephemeral=True)
+                            await modal_inter.response.send_message(
+                                "Failed to rename team (missing perms?).",
+                                ephemeral=True,
+                            )
+
                 await sel_int.response.send_modal(NameModal())
 
             elif choice == "color":
                 class ColorModal(discord.ui.Modal, title="Change Team Color"):
-                    color = discord.ui.TextInput(label="What is your new Teams Color code (in hex):", required=True, max_length=7)
+                    color = discord.ui.TextInput(
+                        label="What is your new team's color code (in hex):",
+                        required=True,
+                        max_length=7,
+                    )
+
                     async def on_submit(self, modal_inter: discord.Interaction):
                         new_code = self.color.value.strip()
                         if not new_code.startswith("#"):
@@ -2563,20 +3427,38 @@ class ManageTeamView(discord.ui.View):
                         try:
                             color_int = int(new_code[1:], 16)
                         except Exception:
-                            await modal_inter.response.send_message("Invalid color code.", ephemeral=True)
+                            await modal_inter.response.send_message(
+                                "Invalid color code.", ephemeral=True
+                            )
                             return
                         old_col = self_view.team_role.colour
                         try:
-                            await self_view.team_role.edit(colour=discord.Colour(color_int), reason=f"Team color change by {modal_inter.user}")
-                            await modal_inter.response.send_message("Team color updated.", ephemeral=True)
-                            await self_view._tx(modal_inter.guild, f"# TEAM HAS CHANGE THERE COLOR CODE\n***• Old Color Code: {old_col} New Color Code: {new_code} ***")
+                            await self_view.team_role.edit(
+                                colour=discord.Colour(color_int),
+                                reason=f"Team color change by {modal_inter.user}",
+                            )
+                            await modal_inter.response.send_message(
+                                "Team color updated.", ephemeral=True
+                            )
+                            await self_view._tx(
+                                modal_inter.guild,
+                                f"# TEAM HAS CHANGE THERE COLOR CODE\n***• Old Color Code: {old_col} New Color Code: {new_code} ***",
+                            )
                         except Exception:
-                            await modal_inter.response.send_message("Failed to change color (missing perms?).", ephemeral=True)
+                            await modal_inter.response.send_message(
+                                "Failed to change color (missing perms?).",
+                                ephemeral=True,
+                            )
+
                 await sel_int.response.send_modal(ColorModal())
 
             elif choice == "pfp":
                 class PFPModal(discord.ui.Modal, title="Set Team Profile Picture"):
-                    url = discord.ui.TextInput(label="What is your new team's pfp? (URL)", required=True)
+                    url = discord.ui.TextInput(
+                        label="What is your new team's pfp? (URL)",
+                        required=True,
+                    )
+
                     async def on_submit(self, modal_inter: discord.Interaction):
                         url_val = self.url.value.strip()
                         try:
@@ -2584,36 +3466,65 @@ class ManageTeamView(discord.ui.View):
                             async with aiohttp.ClientSession() as sess:
                                 async with sess.get(url_val, timeout=15) as resp:
                                     if resp.status != 200:
-                                        await modal_inter.response.send_message("Failed to download image from URL.", ephemeral=True)
+                                        await modal_inter.response.send_message(
+                                            "Failed to download image from URL.",
+                                            ephemeral=True,
+                                        )
                                         return
                                     data = await resp.read()
                         except Exception:
-                            await modal_inter.response.send_message("Failed to download image from URL.", ephemeral=True)
+                            await modal_inter.response.send_message(
+                                "Failed to download image from URL.",
+                                ephemeral=True,
+                            )
                             return
 
                         created_emoji = None
                         try:
-                            await self_view.team_role.edit(reason=f"Team pfp set by {modal_inter.user}", icon=data)
-                            await modal_inter.response.send_message("Team PFP set as role icon (if supported).", ephemeral=True)
+                            await self_view.team_role.edit(
+                                reason=f"Team pfp set by {modal_inter.user}",
+                                icon=data,
+                            )
+                            await modal_inter.response.send_message(
+                                "Team PFP set as role icon (if supported).",
+                                ephemeral=True,
+                            )
                         except Exception:
                             try:
                                 import re
-                                name_safe = re.sub(r"[^0-9A-Za-z_]", "_", self_view.team_role.name)[:32] or "teamimg"
-                                created_emoji = await modal_inter.guild.create_custom_emoji(name=name_safe, image=data, reason="Team pfp uploaded")
+                                name_safe = re.sub(
+                                    r"[^0-9A-Za-z_]", "_", self_view.team_role.name
+                                )[:32] or "teamimg"
+                                created_emoji = await modal_inter.guild.create_custom_emoji(
+                                    name=name_safe,
+                                    image=data,
+                                    reason="Team pfp uploaded",
+                                )
                             except Exception:
                                 created_emoji = None
 
                             if created_emoji:
-                                await modal_inter.response.send_message(f"Team PFP uploaded as emoji: {created_emoji}", ephemeral=True)
+                                await modal_inter.response.send_message(
+                                    f"Team PFP uploaded as emoji: {created_emoji}",
+                                    ephemeral=True,
+                                )
                             else:
-                                await modal_inter.response.send_message("Team PFP updated (or attempt made). If nothing changed, check bot permissions.", ephemeral=True)
+                                await modal_inter.response.send_message(
+                                    "Team PFP updated (or attempt made). "
+                                    "If nothing changed, check bot permissions.",
+                                    ephemeral=True,
+                                )
 
                 await sel_int.response.send_modal(PFPModal())
 
         sel.callback = sel_cb
         v = discord.ui.View(timeout=60)
         v.add_item(sel)
-        await interaction.response.send_message("Choose edit action:", view=v, ephemeral=True)
+        await interaction.response.send_message(
+            "Choose edit action:",
+            view=v,
+            ephemeral=True,
+        )
 
 
 
@@ -2622,230 +3533,99 @@ class StandingCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    # ---------- internal helpers ----------
-
-    def _compute_stats(
-        self,
-        guild: discord.Guild,
-        win_points: int,
-        loss_points: int,
-    ) -> dict[str, dict[str, int]]:
-        """
-        Returns:
-          {
-            "TeamName": {"W": int, "L": int, "PT": int},
-            ...
-          }
-        """
-        teams_data = load_teams()
-        stats: dict[str, dict[str, int]] = {}
-
-        # Initialize teams
-        for entry in teams_data:
-            rid = entry.get("role_id")
-            name = entry.get("name", "Unknown Team")
-            if not rid:
-                continue
-            try:
-                role = guild.get_role(int(rid))
-            except Exception:
-                role = None
-            if role is None:
-                continue
-            stats[name] = {"W": 0, "L": 0, "PT": 0}
-
-        if not stats:
-            return {}
-
-        score_ch = guild.get_channel(MATCH_SCORE_CHANNEL_ID)
-        if not isinstance(score_ch, discord.TextChannel):
-            return stats  # no scores, everyone stays 0
-
-        # Parse messages like:
-        # > Winner: Team1
-        # > Loser: Team2
-        async def _scan():
-            async for msg in score_ch.history(limit=500):
-                content = msg.content or ""
-                lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
-                if not lines:
-                    continue
-
-                winner_name = None
-                loser_name = None
-
-                for ln in lines:
-                    ln_clean = ln.lstrip("> ").strip()
-                    lower = ln_clean.lower()
-                    if lower.startswith("winner:"):
-                        winner_name = ln_clean.split(":", 1)[1].strip()
-                    elif lower.startswith("loser:"):
-                        loser_name = ln_clean.split(":", 1)[1].strip()
-
-                if not winner_name or not loser_name:
-                    continue
-                if winner_name not in stats or loser_name not in stats:
-                    continue
-
-                stats[winner_name]["W"] += 1
-                stats[loser_name]["L"] += 1
-
-        # run async history scan in sync function via loop
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(_scan())
-
-        # Compute points with provided config
-        for name, s in stats.items():
-            s["PT"] = s["W"] * win_points + s["L"] * loss_points
-
-        return stats
-
-    def _format_seeding_message(self, stats: dict[str, dict[str, int]]) -> str:
-        if not stats:
-            return "PGL Seeding\n\nNo teams found."
-
-        ordered = sorted(
-            stats.items(),
-            key=lambda kv: (-kv[1]["PT"], kv[0].lower()),
-        )
-
-        lines = ["PGL Seeding", ""]
-        for name, s in ordered:
-            lines.append(f"{name} | {s['W']}W | {s['L']}L | {s['PT']}P")
-
-        return "\n".join(lines)
-
-    async def _get_seeding_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
-        ch_cfg = CONFIG.get("channels", {}) or {}
-        ch_id = ch_cfg.get("seeding_points") or SEEDING_POINTS_CHANNEL_ID
-        ch = guild.get_channel(ch_id) if ch_id else None
-        return ch if isinstance(ch, discord.TextChannel) else None
-
-    # ---------- /start-seeding ----------
-
     @app_commands.guilds(Object(id=TEST_GUILD_ID))
     @app_commands.default_permissions(administrator=True)
     @app_commands.command(
         name="start-seeding",
-        description="Enable seeding and post/update the seeding table.",
+        description="Enable seeding and allow /standing to be used.",
     )
-    @app_commands.describe(
-        win_points="Points given for a win (e.g. 3)",
-        loss_points="Points given for a loss (e.g. -1, 0, 1)",
-    )
-    async def start_seeding(
-        self,
-        interaction: discord.Interaction,
-        win_points: int,
-        loss_points: int,
-    ):
+    async def start_seeding(self, interaction: discord.Interaction):
         global SEEDING_OPEN
-        guild = interaction.guild
-        if guild is None:
-            await interaction.response.send_message(
-                "Use this in a server.",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
         SEEDING_OPEN = True
 
-        seeding_ch = await self._get_seeding_channel(guild)
-        if seeding_ch is None:
-            await interaction.followup.send(
-                "Seeding channel not configured.",
-                ephemeral=True,
-            )
-            return
-
-        # Compute stats
-        stats = self._compute_stats(guild, win_points, loss_points)
-        content = self._format_seeding_message(stats)
-
-        state = load_seeding_state()
-        msg_id = state.get("message_id")
-
-        seeding_msg: Optional[discord.Message] = None
-        if msg_id:
-            try:
-                seeding_msg = await seeding_ch.fetch_message(int(msg_id))
-            except Exception:
-                seeding_msg = None
-
-        # Edit existing or send new
-        if seeding_msg:
-            try:
-                await seeding_msg.edit(content=content)
-            except Exception:
-                seeding_msg = None
-
-        if seeding_msg is None:
-            seeding_msg = await seeding_ch.send(content)
-
-        # Save state
-        state = {
-            "guild_id": guild.id,
-            "channel_id": seeding_ch.id,
-            "message_id": seeding_msg.id,
-            "win_points": win_points,
-            "loss_points": loss_points,
-            "open": True,
-        }
-        save_seeding_state(state)
-
-        await interaction.followup.send(
-            f"Seeding started with win={win_points}, loss={loss_points}.",
+        guild = interaction.guild
+        await interaction.response.send_message(
+            "Seeding has started. `/standing` is now available to everyone.",
             ephemeral=True,
         )
 
-    # ---------- /end-seeding ----------
+        if guild is None:
+            return
+
+        # resolve seeding-points channel: CONFIG override -> constant
+        ch_cfg = CONFIG.get("channels", {}) or {}
+        ch_id = ch_cfg.get("seeding_points") or SEEDING_POINTS_CHANNEL_ID
+        seeding_ch = guild.get_channel(ch_id) if ch_id else None
+        if not isinstance(seeding_ch, discord.TextChannel):
+            return  # nothing configured, just skip
+
+        info_text = (
+            "use `/standing` to see the seeding, and here is how points work:\n\n"
+            "for winning = **3 PTS**\n"
+            "for losing = **1 PTS**\n"
+            "for a time cap = **3 extra PTS**"
+        )
+
+        # only post once: check recent messages for exact same text from this bot
+        already_posted = False
+        try:
+            async for msg in seeding_ch.history(limit=50):
+                if msg.author == self.bot.user and msg.content.strip() == info_text.strip():
+                    already_posted = True
+                    break
+        except Exception:
+            pass
+
+        if not already_posted:
+            try:
+                await seeding_ch.send(info_text)
+            except Exception:
+                pass
 
     @app_commands.guilds(Object(id=TEST_GUILD_ID))
     @app_commands.default_permissions(administrator=True)
     @app_commands.command(
         name="end-seeding",
-        description="Disable seeding and delete the seeding message.",
+        description="Disable seeding and hide /standing for everyone.",
     )
     async def end_seeding(self, interaction: discord.Interaction):
         global SEEDING_OPEN
-        guild = interaction.guild
-        if guild is None:
-            await interaction.response.send_message(
-                "Use this in a server.",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
         SEEDING_OPEN = False
 
-        state = load_seeding_state()
-        ch_id = state.get("channel_id")
-        msg_id = state.get("message_id")
-
-        if ch_id and msg_id:
-            ch = guild.get_channel(int(ch_id))
-            if isinstance(ch, discord.TextChannel):
-                try:
-                    msg = await ch.fetch_message(int(msg_id))
-                    await msg.delete()
-                except Exception:
-                    pass
-
-        # clear state
-        state["open"] = False
-        state["message_id"] = None
-        save_seeding_state(state)
-
-        await interaction.followup.send(
-            "Seeding ended and seeding message deleted (if found).",
+        guild = interaction.guild
+        await interaction.response.send_message(
+            "Seeding has ended. `/standing` is now disabled for everyone.",
             ephemeral=True,
         )
 
-    # ---------- /standing (ephemeral view of same table) ----------
+        if guild is None:
+            return
+
+        # resolve seeding-points channel: CONFIG override -> constant
+        ch_cfg = CONFIG.get("channels", {}) or {}
+        ch_id = ch_cfg.get("seeding_points") or SEEDING_POINTS_CHANNEL_ID
+        seeding_ch = guild.get_channel(ch_id) if ch_id else None
+        if not isinstance(seeding_ch, discord.TextChannel):
+            return
+
+        info_text = (
+            "use `/standing` to see the seeding, and here is how points work:\n\n"
+            "for winning = **3 PTS**\n"
+            "for losing = **1 PTS**\n"
+            "for a time cap = **3 extra PTS**"
+        )
+
+        # find and delete the info message posted by this bot
+        try:
+            async for msg in seeding_ch.history(limit=50):
+                if msg.author == self.bot.user and msg.content.strip() == info_text.strip():
+                    try:
+                        await msg.delete()
+                    except Exception:
+                        pass
+                    break
+        except Exception:
+            pass
 
     @app_commands.guilds(Object(id=TEST_GUILD_ID))
     @app_commands.command(
@@ -2855,6 +3635,14 @@ class StandingCog(commands.Cog):
     async def standing(self, interaction: discord.Interaction):
         global SEEDING_OPEN
 
+        # Block if seeding is closed (must answer here, no defer yet)
+        if not SEEDING_OPEN:
+            await interaction.response.send_message(
+                "Seeding is not currently active. Standings are hidden.",
+                ephemeral=True,
+            )
+            return
+
         guild = interaction.guild
         if guild is None:
             await interaction.response.send_message(
@@ -2863,263 +3651,679 @@ class StandingCog(commands.Cog):
             )
             return
 
-        if not SEEDING_OPEN:
-            await interaction.response.send_message(
-                "Seeding is not currently active.",
-                ephemeral=True,
-            )
-            return
-
+        # From here on we can safely defer and use followup
         await interaction.response.defer(ephemeral=True)
 
-        state = load_seeding_state()
-        win_points = state.get("win_points")
-        loss_points = state.get("loss_points")
-
-        if win_points is None or loss_points is None:
+        teams_data = load_teams()
+        if not teams_data:
             await interaction.followup.send(
-                "Seeding point values are not set. Use /start-seeding again.",
+                "There are no teams in the system.",
                 ephemeral=True,
             )
             return
 
-        stats = self._compute_stats(guild, int(win_points), int(loss_points))
-        content = self._format_seeding_message(stats)
+        stats: dict[str, dict[str, int]] = {}
+        for entry in teams_data:
+            rid = entry.get("role_id")
+            name = entry.get("name", "Unknown Team")
+            try:
+                role = guild.get_role(int(rid)) if rid else None
+            except Exception:
+                role = None
+            if role is None:
+                continue
+            stats[name] = {"W": 0, "L": 0, "TC": 0, "PT": 0}
 
-        await interaction.followup.send(content, ephemeral=True)
+        if not stats:
+            await interaction.followup.send(
+                "There are no valid teams in the system.",
+                ephemeral=True,
+            )
+            return
+
+        score_ch = guild.get_channel(MATCH_SCORE_CHANNEL_ID)
+        if score_ch is None or not isinstance(score_ch, discord.TextChannel):
+            await interaction.followup.send(
+                "Match scores channel is not configured correctly.",
+                ephemeral=True,
+            )
+            return
+
+        async for msg in score_ch.history(limit=500):
+            content = msg.content
+            lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+            if not lines:
+                continue
+            try:
+                winner_name = None
+                loser_name = None
+                timecap_val = "no"
+                for ln in lines:
+                    ln_clean = ln.lstrip("> ").strip()
+                    lower = ln_clean.lower()
+                    if lower.startswith("winner:"):
+                        winner_name = ln_clean.split(":", 1)[1].strip()
+                    elif lower.startswith("loser:"):
+                        loser_name = ln_clean.split(":", 1)[1].strip()
+                    elif lower.startswith("timecap:"):
+                        timecap_val = ln_clean.split(":", 1)[1].strip()
+                if not winner_name or not loser_name:
+                    continue
+                if winner_name not in stats or loser_name not in stats:
+                    continue
+                stats[winner_name]["W"] += 1
+                stats[loser_name]["L"] += 1
+                if timecap_val.lower() != "no":
+                    stats[winner_name]["TC"] += 1
+            except Exception:
+                continue
+
+        for name, s in stats.items():
+            s["PT"] = 3 * s["W"] + 1 * s["L"] + 3 * s["TC"]
+
+        ordered = sorted(
+            stats.items(),
+            key=lambda kv: (-kv[1]["PT"], kv[0].lower()),
+        )
+        if not ordered:
+            await interaction.followup.send(
+                "There are no results for any teams yet.",
+                ephemeral=True,
+            )
+            return
+
+        lines_out = ["Monke Monke Monke League SEEDING"]
+        rank = 1
+        for name, s in ordered:
+            lines_out.append(
+                f"> {rank}. {name} {s['W']} W - {s['L']} L - {s['PT']} PT"
+            )
+            rank += 1
+
+        await interaction.followup.send("\n".join(lines_out), ephemeral=True)
+
+
+
+
+
 
 
 class AssignmentClaimView(discord.ui.View):
-    def __init__(
-        self,
-        week: str,
-        time: str,
-        team1_name: str,
-        team2_name: str,
-    ):
+    def __init__(self, week: str, time: str, team1_name: str, team2_name: str):
         super().__init__(timeout=None)
-
         self.week = week
         self.time = time
         self.team1_name = team1_name
         self.team2_name = team2_name
+        self.caster: Optional[discord.Member] = None
+        self.referee: Optional[discord.Member] = None
 
-        self.ref_main: Optional[int] = None
-        self.ref_backup: Optional[int] = None
-        self.caster_main: Optional[int] = None
-        self.caster_backup: Optional[int] = None
-        self.commentator_main: Optional[int] = None
-        self.commentator_backup: Optional[int] = None
+    async def _find_message_to_edit(self, channel: discord.TextChannel) -> Optional[discord.Message]:
+        if channel is None:
+            return None
 
-        # These custom IDs must be unique for this type of view.
-        self.add_item(
-            AssignmentClaimButton(
-                "ref_main",
-                "Claim Main Referee",
-                discord.ButtonStyle.primary,
-            )
-        )
-        self.add_item(
-            AssignmentClaimButton(
-                "ref_backup",
-                "Claim Backup Referee",
-                discord.ButtonStyle.secondary,
-            )
-        )
-        self.add_item(
-            AssignmentClaimButton(
-                "caster_main",
-                "Claim Main Caster",
-                discord.ButtonStyle.primary,
-            )
-        )
-        self.add_item(
-            AssignmentClaimButton(
-                "caster_backup",
-                "Claim Backup Caster",
-                discord.ButtonStyle.secondary,
-            )
-        )
-        self.add_item(
-            AssignmentClaimButton(
-                "commentator_main",
-                "Claim Main Commentator",
-                discord.ButtonStyle.primary,
-            )
-        )
-        self.add_item(
-            AssignmentClaimButton(
-                "commentator_backup",
-                "Claim Backup Commentator",
-                discord.ButtonStyle.secondary,
-            )
-        )
+        stage_l = (self.week or "").lower()
+        if "final" in stage_l:
+            header = "# FINALS"
+            special = True
+        elif "semi" in stage_l:
+            header = "# SEMIFINALS"
+            special = True
+        else:
+            header = ""
+            special = False
 
-    async def claim_role(
-        self,
-        interaction: discord.Interaction,
-        role_name: str,
-    ):
-        user_id = interaction.user.id
+        teams_line_regular = f"{self.team1_name} vs {self.team2_name}"
+        teams_line_special = f"> Teams: {self.team1_name} vs {self.team2_name}"
+        q_week = f"> WEEK: {self.week}"
+        q_time = f"> Time: {self.time}"
 
-        # Prevent the same person from claiming multiple positions.
-        current_claims = {
-            self.ref_main,
-            self.ref_backup,
-            self.caster_main,
-            self.caster_backup,
-            self.commentator_main,
-            self.commentator_backup,
-        }
+        try:
+            async for msg in channel.history(limit=200):
+                c = msg.content or ""
+                if special:
+                    if header in c and teams_line_special in c:
+                        return msg
+                else:
+                    if teams_line_regular in c and q_week in c and q_time in c:
+                        return msg
+        except Exception:
+            return None
+        return None
 
-        if user_id in current_claims:
-            await interaction.response.send_message(
-                "You already claimed a position for this match.",
-                ephemeral=True,
-            )
+    async def _update_messages(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        if guild is None:
             return
 
-        if getattr(self, role_name) is not None:
-            await interaction.response.send_message(
-                "That position has already been claimed.",
-                ephemeral=True,
+        match_times = guild.get_channel(MATCH_TIMES_CHANNEL_ID)
+        assignments = guild.get_channel(ASSIGNMENTS_CHANNEL_ID)
+
+        caster_text = self.caster.mention if self.caster else ""
+        ref_text = self.referee.mention if self.referee else ""
+
+        stage_l = (self.week or "").lower()
+        if "final" in stage_l:
+            header = "# FINALS"
+            special = True
+        elif "semi" in stage_l:
+            header = "# SEMIFINALS"
+            special = True
+        else:
+            header = None
+            special = False
+
+        # Build Discord timestamp from the stored time string
+        unix_ts = parse_time_to_unix_est(self.time)
+        ts_str = f" (<t:{unix_ts}:F>)" if unix_ts is not None else ""
+
+        # --------- MATCH_TIMES message content ---------
+        if special:
+            mt_content = (
+                f"{header}\n"
+                f"> Teams: {self.team1_name} vs {self.team2_name}\n"
+                f"> Time: {self.time}{ts_str}\n"
+                f"> Referee: {ref_text}\n"
+                f"> Caster: {caster_text}"
             )
+        else:
+            mt_content = (
+                f"{self.team1_name} vs {self.team2_name}\n"
+                f"> WEEK: {self.week}\n"
+                f"> Time: {self.time}{ts_str}\n"
+                f"> Referee: {ref_text}\n"
+                f"> Caster: {caster_text}"
+            )
+
+        if isinstance(match_times, discord.TextChannel):
+            mt_msg = await self._find_message_to_edit(match_times)
+            try:
+                if mt_msg:
+                    await mt_msg.edit(content=mt_content)
+            except Exception:
+                pass
+
+        # --------- ASSIGNMENTS message content ---------
+        staff_mentions = []
+        for rid in (HEAD_REF_ROLE_ID, REF_ROLE_ID, HEAD_CASTER_ROLE_ID, CASTER_ROLE_ID):
+            r = guild.get_role(rid)
+            if r:
+                staff_mentions.append(r.mention)
+        staff_header = " ".join(staff_mentions)
+
+        if special:
+            as_content = (
+                f"{staff_header}\n"
+                f"{header}\n"
+                f"> Teams: {self.team1_name} vs {self.team2_name}\n"
+                f"> Time: {self.time}{ts_str}\n"
+                f"> Referee: {ref_text}\n"
+                f"> Caster: {caster_text}"
+            )
+        else:
+            as_content = (
+                f"{staff_header}\n"
+                f"{self.team1_name} vs {self.team2_name}\n"
+                f"> WEEK: {self.week}\n"
+                f"> Time: {self.time}{ts_str}\n"
+                f"> Referee: {ref_text}\n"
+                f"> Caster: {caster_text}"
+            )
+
+        if isinstance(assignments, discord.TextChannel):
+            as_msg = await self._find_message_to_edit(assignments)
+            try:
+                if as_msg:
+                    await as_msg.edit(content=as_content, view=self)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Claim Caster", style=discord.ButtonStyle.primary)
+    async def claim_caster(self, interaction: discord.Interaction, button: discord.ui.Button):
+        user = interaction.user
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
             return
 
-        setattr(self, role_name, user_id)
+        is_finals = "final" in (self.week or "").lower()
+        is_admin = user.guild_permissions.administrator
 
-        await interaction.response.send_message(
-            f"You claimed **{role_name.replace('_', ' ').title()}**.",
-            ephemeral=True,
-        )
+        # Normal matches: any caster or head caster can claim.
+        # Finals: ONLY head caster (plus admins) can claim.
+        has_caster = has_role_id(user, CASTER_ROLE_ID) or has_role_id(user, HEAD_CASTER_ROLE_ID)
+        has_head_caster = has_role_id(user, HEAD_CASTER_ROLE_ID)
 
-        if interaction.message:
-            await interaction.message.edit(view=self)
+        if is_finals:
+            if not (has_head_caster or is_admin):
+                await interaction.response.send_message(
+                    "Only Head Casters (or admins) may claim Caster for Finals.",
+                    ephemeral=True,
+                )
+                return
+        else:
+            if not has_caster:
+                await interaction.response.send_message(
+                    "Only casters may claim this slot.",
+                    ephemeral=True,
+                )
+                return
+
+        prev = self.caster
+        self.caster = user
+
+        # disable only this button for this view
+        button.disabled = True
+        await interaction.response.send_message("You claimed Caster.", ephemeral=True)
+
+        if prev and prev != user:
+            try:
+                await prev.send(
+                    f"You were unclaimed as Caster for {self.team1_name} vs {self.team2_name}."
+                )
+            except Exception:
+                pass
+
+        await self._update_messages(interaction)
+
+    @discord.ui.button(label="Claim Referee", style=discord.ButtonStyle.primary)
+    async def claim_ref(self, interaction: discord.Interaction, button: discord.ui.Button):
+        user = interaction.user
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            return
+
+        is_finals = "final" in (self.week or "").lower()
+        is_admin = user.guild_permissions.administrator
+
+        # Normal matches: any ref or head ref can claim.
+        # Finals: ONLY head ref (or admins) can claim.
+        has_ref = has_role_id(user, REF_ROLE_ID) or has_role_id(user, HEAD_REF_ROLE_ID)
+        has_head_ref = has_role_id(user, HEAD_REF_ROLE_ID)
+
+        if is_finals:
+            if not (has_head_ref or is_admin):
+                await interaction.response.send_message(
+                    "Only Head Referees (or admins) may claim Referee for Finals.",
+                    ephemeral=True,
+                )
+                return
+        else:
+            if not has_ref:
+                await interaction.response.send_message(
+                    "Only referees may claim this slot.",
+                    ephemeral=True,
+                )
+                return
+
+        prev = self.referee
+        self.referee = user
+
+        button.disabled = True
+        await interaction.response.send_message("You claimed Referee.", ephemeral=True)
+
+        if prev and prev != user:
+            try:
+                await prev.send(
+                    f"You were unclaimed as Referee for {self.team1_name} vs {self.team2_name}."
+                )
+            except Exception:
+                pass
+
+        await self._update_messages(interaction)
+
+    @discord.ui.button(label="Unclaim", style=discord.ButtonStyle.danger)
+    async def unclaim(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Clear both claims; Unclaim button stays enabled
+        self.caster = None
+        self.referee = None
+        # Re-enable claim buttons on this view instance (they will be re-rendered enabled)
+        for child in self.children:
+            if isinstance(child, discord.ui.Button) and child.label in ("Claim Caster", "Claim Referee"):
+                child.disabled = False
+        await interaction.response.send_message("Claims cleared.", ephemeral=True)
+        await self._update_messages(interaction)
 
 
-
-class AssignmentClaimButton(discord.ui.Button):
+class TimeAcceptView(discord.ui.View):
     def __init__(
         self,
-        role_name: str,
-        label: str,
-        style: discord.ButtonStyle,
+        guild: discord.Guild,
+        team1_role: Optional[discord.Role],
+        team2_role: Optional[discord.Role],
+        team1_name: str,
+        team2_name: str,
+        week: str,
+        time: str,
     ):
-        self.role_name = role_name
+        super().__init__(timeout=None)
+        self.guild = guild
+        self.team1_role = team1_role
+        self.team2_role = team2_role
+        self.team1_name = team1_name
+        self.team2_name = team2_name
+        self.week = week
+        self.time = time
 
-        super().__init__(
-            label=label,
-            style=style,
-            custom_id=f"assignment_claim:{role_name}",
-        )
+        # runtime state
+        self.team1_accepted: bool = False
+        self.team2_accepted: bool = False
+        self.origin_message: Optional[discord.Message] = None
 
-    async def callback(self, interaction: discord.Interaction):
-        if not isinstance(self.view, AssignmentClaimView):
-            await interaction.response.send_message(
-                "This assignment view is no longer available.",
-                ephemeral=True,
+        # for origin message display
+        self.team1_mention = team1_role.mention if isinstance(team1_role, discord.Role) else team1_name
+        self.team2_mention = team2_role.mention if isinstance(team2_role, discord.Role) else team2_name
+
+    def _is_team_lead(self, member: discord.Member, team_role: Optional[discord.Role]) -> bool:
+        if team_role is None:
+            return False
+        if team_role not in member.roles:
+            return False
+        return any(has_role_id(member, rid) for rid in (CAPTAIN_ROLE_ID, CO_CAPTAIN_ROLE_ID, TEAM_EXEC_ROLE_ID))
+
+    async def _finalize_if_ready(self, interaction: discord.Interaction):
+        if not (self.team1_accepted and self.team2_accepted):
+            return
+
+        guild = self.guild
+        match_times = guild.get_channel(MATCH_TIMES_CHANNEL_ID)
+        assignments = guild.get_channel(ASSIGNMENTS_CHANNEL_ID)
+
+        stage_l = (self.week or "").lower()
+        if "final" in stage_l:
+            header = "# FINALS"
+            special = True
+        elif "semi" in stage_l:
+            header = "# SEMIFINALS"
+            special = True
+        else:
+            header = None
+            special = False
+
+        # build discord timestamp
+        unix_ts = parse_time_to_unix_est(self.time)
+        ts_str = f"<t:{unix_ts}:F>" if unix_ts is not None else self.time
+
+        if special:
+            mt_content = (
+                f"{header}\n"
+                f"> Teams: {self.team1_name} vs {self.team2_name}\n"
+                f"> Time: {ts_str}\n"
+                f"> Referee: \n"
+                f"> Caster: "
             )
+        else:
+            mt_content = (
+                f"{self.team1_name} vs {self.team2_name}\n"
+                f"> WEEK: {self.week}\n"
+                f"> Time: {ts_str}\n"
+                f"> Referee: \n"
+                f"> Caster: "
+            )
+
+
+        if isinstance(match_times, discord.TextChannel):
+            try:
+                await match_times.send(mt_content)
+            except Exception:
+                pass
+
+        # ASSIGNMENTS message
+        staff_mentions = []
+        for rid in (HEAD_REF_ROLE_ID, REF_ROLE_ID, HEAD_CASTER_ROLE_ID, CASTER_ROLE_ID):
+            r = guild.get_role(rid)
+            if r:
+                staff_mentions.append(r.mention)
+        staff_header = " ".join(staff_mentions)
+
+        if special:
+            as_content = (
+                f"{staff_header}\n"
+                f"{header}\n"
+                f"> Teams: {self.team1_name} vs {self.team2_name}\n"
+                f"> Time: {self.time}{ts_str}\n"
+                f"> Referee: \n"
+                f"> Caster: "
+            )
+        else:
+            as_content = (
+                f"{staff_header}\n"
+                f"{self.team1_name} vs {self.team2_name}\n"
+                f"> WEEK: {self.week}\n"
+                f"> Time: {self.time}{ts_str}\n"
+                f"> Referee: \n"
+                f"> Caster: "
+            )
+
+        if isinstance(assignments, discord.TextChannel):
+            try:
+                view = AssignmentClaimView(self.week, self.time, self.team1_name, self.team2_name)
+                await assignments.send(as_content, view=view)
+            except Exception:
+                pass
+
+    async def _edit_origin(self):
+        if not self.origin_message:
+            return
+        t1_line = f"{self.team1_mention}"
+        t2_line = f"{self.team2_mention}"
+        if self.team1_accepted:
+            t1_line += " ✅"
+        if self.team2_accepted:
+            t2_line += " ✅"
+        content = (
+            f"{t1_line} vs {t2_line}\n"
+            f"Team staff must accept this match.\n"
+            f"> WEEK: {self.week}\n"
+            f"> Time: {self.time}\n"
+            f"> Team 1: {'Accepted ✅' if self.team1_accepted else ''}\n"
+            f"> Team 2: {'Accepted ✅' if self.team2_accepted else ''}\n"
+        )
+        try:
+            await self.origin_message.edit(content=content, view=self)
+        except Exception:
+            pass
+
+    @discord.ui.button(label="Accept for Team 1", style=discord.ButtonStyle.success)
+    async def accept_team1(self, interaction: discord.Interaction, button: discord.ui.Button):
+        member = interaction.user
+        if not self._is_team_lead(member, self.team1_role):
+            await interaction.response.send_message("Only staff from Team 1 (captain/co-cap/exec) can accept.", ephemeral=True)
+            return
+        if self.team1_accepted:
+            await interaction.response.send_message("Team 1 already accepted.", ephemeral=True)
             return
 
-        await self.view.claim_role(
-            interaction,
-            self.role_name,
+        self.team1_accepted = True
+        # disable only Team 1 button
+        for child in self.children:
+            if isinstance(child, discord.ui.Button) and child.label == "Accept for Team 1":
+                child.disabled = True
+
+        await self._edit_origin()
+        await interaction.response.send_message("Team 1 accepted.", ephemeral=True)
+        await self._finalize_if_ready(interaction)
+
+    @discord.ui.button(label="Accept for Team 2", style=discord.ButtonStyle.success)
+    async def accept_team2(self, interaction: discord.Interaction, button: discord.ui.Button):
+        member = interaction.user
+        if not self._is_team_lead(member, self.team2_role):
+            await interaction.response.send_message("Only staff from Team 2 (captain/co-cap/exec) can accept.", ephemeral=True)
+            return
+        if self.team2_accepted:
+            await interaction.response.send_message("Team 2 already accepted.", ephemeral=True)
+            return
+
+        self.team2_accepted = True
+        # disable only Team 2 button
+        for child in self.children:
+            if isinstance(child, discord.ui.Button) and child.label == "Accept for Team 2":
+                child.disabled = True
+
+        await self._edit_origin()
+        await interaction.response.send_message("Team 2 accepted.", ephemeral=True)
+        await self._finalize_if_ready(interaction)
+
+
+
+
+class ForceTimeView(discord.ui.View):
+    def __init__(
+        self,
+        team1_role: Optional[discord.Role],
+        team2_role: Optional[discord.Role],
+        team1_mention: str,
+        team2_mention: str,
+        team1_name: str,
+        team2_name: str,
+        time_str: str,
+    ):
+        super().__init__(timeout=None)
+        self.team1_role = team1_role
+        self.team2_role = team2_role
+        self.team1_mention = team1_mention
+        self.team2_mention = team2_mention
+        self.team1_name = team1_name
+        self.team2_name = team2_name
+        self.time_str = time_str
+
+    def _build_forced_message(self) -> str:
+        # Only the "real time" line, for after /force-time is accepted
+        return f"{self.team1_mention} {self.team2_mention} Your day to play is: {self.time_str}"
+
+
+    def _build_staff_message(self, guild: discord.Guild) -> str:
+        staff_mentions = []
+        for rid in (
+            BOARD_OF_DIRECTORS_ROLE_ID,
+            COMMUNITY_MANAGER_ROLE_ID,
+            SUPERVISOR_ROLE_ID,
+            DEVELOPMENT_TEAM_ROLE_ID,  # <- added
+        ):
+
+            r = guild.get_role(rid)
+            if r:
+                staff_mentions.append(r.mention)
+        staff_header = " ".join(staff_mentions) or ""
+
+        return (
+            f"{staff_header}\n"
+            f"I have picked this time for {self.team1_mention} and {self.team2_mention}: **{self.time_str}**\n\n"
+            f"If you want me to post the message click on the **Accept** button,\n"
+            f"but if you want me to find a new time click the **Deny** button."
         )
 
+    def _find_scheduling_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
+        """
+        Try to find a scheduling channel for these two teams.
+        Uses channel name and topic; assumes '-vs-' style channels like 'team1-vs-team2'.
+        """
+        t1 = self.team1_name.lower()
+        t2 = self.team2_name.lower()
 
+        def norm(s: str) -> str:
+            import re
+            return re.sub(r"[^a-z0-9]", "", s.lower())
 
-MAIN_ALERT_TEXT = (
-    "# 🚨 SCRIM ALERT 🚨\n"
-    "You are receiving this because you’re a **Ref, Caster, or Commentator** for a PGL official in 10 minutes "
-    "so please, click the accept button if you can make it, if you can’t, then click the deny button, "
-    "then we will find a backup caster, ref, or commentator that will take your spot."
-)
+        n_t1 = norm(t1)
+        n_t2 = norm(t2)
 
-BACKUP_ALERT_TEXT = (
-    "# 🚨 SCRIM ALERT 🚨\n"
-    "You are receiving this because you’re a backup **Ref, Caster, or Commentator** for a PGL official in 10 minutes "
-    "so please, click the accept button if you can make it, if you can’t, then click the deny button, "
-    "then we will find a new backup caster, ref, or commentator that will take your backup spot."
-)
-
-class ScrimAlertDMView(discord.ui.View):
-    def __init__(self, match_id: str, role_type: RoleType, is_backup: bool, target_user_id: int):
-        super().__init__(timeout=60 * 60)  # 1 hour
-        self.match_id = match_id
-        self.role_type = role_type
-        self.is_backup = is_backup
-        self.target_user_id = target_user_id
-
-    def _still_assigned(self, m: MatchAssignment) -> bool:
-        uid = self.target_user_id
-        if self.role_type == "ref":
-            return (m.ref_backup == uid) if self.is_backup else (m.ref_main == uid)
-        if self.role_type == "caster":
-            return (m.caster_backup == uid) if self.is_backup else (m.caster_main == uid)
-        # commentator: membership in list
-        return (uid in m.comm_backup) if self.is_backup else (uid in m.comm_main)
-
-    def _remove_assignment(self, m: MatchAssignment) -> bool:
-        uid = self.target_user_id
-        changed = False
-
-        if self.role_type == "ref":
-            if self.is_backup and m.ref_backup == uid:
-                m.ref_backup = None; changed = True
-            if (not self.is_backup) and m.ref_main == uid:
-                m.ref_main = None; changed = True
-
-        elif self.role_type == "caster":
-            if self.is_backup and m.caster_backup == uid:
-                m.caster_backup = None; changed = True
-            if (not self.is_backup) and m.caster_main == uid:
-                m.caster_main = None; changed = True
-
-        else:  # commentator
-            if self.is_backup and uid in m.comm_backup:
-                m.comm_backup = [x for x in m.comm_backup if x != uid]; changed = True
-            if (not self.is_backup) and uid in m.comm_main:
-                m.comm_main = [x for x in m.comm_main if x != uid]; changed = True
-
-        return changed
-
-    async def _log_and_refresh(self, interaction: discord.Interaction, note: str):
-        m = MATCHES.get(self.match_id)
-        if not m:
-            return
-
-        guild = interaction.client.get_guild(m.guild_id)
-        if not guild:
-            return
-
-        log_ch = guild.get_channel(ALERT_LOG_CHANNEL_ID)
-        if isinstance(log_ch, discord.TextChannel):
-            try:
-                await log_ch.send(note, allowed_mentions=discord.AllowedMentions(roles=False, users=True, everyone=False))
-            except Exception:
-                pass
-
-        # refresh the assignment message
-        ch = guild.get_channel(m.channel_id)
-        if isinstance(ch, discord.TextChannel):
-            try:
-                msg = await ch.fetch_message(m.message_id)
-                await msg.edit(content=render_assignment_post(guild, m), view=AssignmentClaimView(m.match_id))
-            except Exception:
-                pass
+        for ch in guild.text_channels:
+            name = ch.name or ""
+            topic = ch.topic or ""
+            if "-vs-" not in name.lower():
+                continue
+            combined = name + " " + topic
+            n_combined = norm(combined)
+            if n_t1 in n_combined and n_t2 in n_combined:
+                return ch
+        return None
 
     @discord.ui.button(label="Accept", style=discord.ButtonStyle.success)
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.target_user_id:
-            await interaction.response.send_message("This isn’t for you.", ephemeral=True)
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
             return
 
-        m = MATCHES.get(self.match_id)
-        if not m or not self._still_assigned(m):
-            await interaction.response.send_message("You’re no longer assigned to this.", ephemeral=True)
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Only admins can accept.", ephemeral=True)
             return
 
-        await interaction.response.send_message("Accepted. Thank you.", ephemeral=True)
+        # 1) Find the scheduling channel based on team names and post forced-time message
+        sched_ch = self._find_scheduling_channel(guild)
+        if not isinstance(sched_ch, discord.TextChannel):
+            await interaction.response.send_message(
+                "Could not find a scheduling channel for these teams.",
+                ephemeral=True,
+            )
+            return
+
+        forced_msg = self._build_forced_message()
+        try:
+            await sched_ch.send(forced_msg)
+        except Exception:
+            await interaction.response.send_message("Failed to send forced time message.", ephemeral=True)
+            return
+
+        # 2) Auto "submit time" into MATCH_TIMES and ASSIGNMENTS
+
+        # Treat this as WEEK: Forced
+        week = "Forced"
+        time_str = self.time_str
+
+        unix_ts = parse_time_to_unix_est(time_str)
+        ts_str = f"<t:{unix_ts}:F>" if unix_ts is not None else time_str
+
+
+        # MATCH_TIMES entry (like a finalized time)
+        match_times = guild.get_channel(MATCH_TIMES_CHANNEL_ID)
+        if isinstance(match_times, discord.TextChannel):
+            mt_content = (
+                f"{self.team1_name} vs {self.team2_name}\n"
+                f"> WEEK: {week}\n"
+                f"> Time: {ts_str}\n"
+                f"> Referee: \n"
+                f"> Caster: "
+            )
+
+            try:
+                await match_times.send(mt_content)
+            except Exception:
+                pass
+
+        # ASSIGNMENTS entry with AssignmentClaimView so staff can claim
+        assignments = guild.get_channel(ASSIGNMENTS_CHANNEL_ID)
+        if isinstance(assignments, discord.TextChannel):
+            staff_mentions = []
+            for rid in (HEAD_REF_ROLE_ID, REF_ROLE_ID, HEAD_CASTER_ROLE_ID, CASTER_ROLE_ID):
+                r = guild.get_role(rid)
+                if r:
+                    staff_mentions.append(r.mention)
+            staff_header = " ".join(staff_mentions)
+
+            as_content = (
+                f"{staff_header}\n"
+                f"{self.team1_name} vs {self.team2_name}\n"
+                f"> WEEK: {week}\n"
+                f"> Time: {time_str}{ts_str}\n"
+                f"> Referee: \n"
+                f"> Caster: "
+            )
+            try:
+                view = AssignmentClaimView(week=week, time=time_str,
+                                           team1_name=self.team1_name,
+                                           team2_name=self.team2_name)
+                await assignments.send(as_content, view=view)
+            except Exception:
+                pass
+
+        # 3) Finish up the interaction
+        await interaction.response.send_message(
+            f"Forced time posted in {sched_ch.mention} and scheduling records updated.",
+            ephemeral=True,
+        )
         for child in self.children:
             if isinstance(child, discord.ui.Button):
                 child.disabled = True
@@ -3131,618 +4335,154 @@ class ScrimAlertDMView(discord.ui.View):
 
     @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger)
     async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.target_user_id:
-            await interaction.response.send_message("This isn’t for you.", ephemeral=True)
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
             return
 
-        m = MATCHES.get(self.match_id)
-        if not m or not self._still_assigned(m):
-            await interaction.response.send_message("You’re no longer assigned to this.", ephemeral=True)
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Only admins can deny.", ephemeral=True)
             return
 
-        self._remove_assignment(m)
+        # pick a new time
+        self.time_str = generate_forced_time_string()
 
-        await interaction.response.send_message("Denied. We’ll find a replacement.", ephemeral=True)
-
-        who = f"<@{self.target_user_id}>"
-        slot = f"{self.role_type.upper()} ({'BACKUP' if self.is_backup else 'MAIN'})"
-        note = f"{who} denied **{slot}** for: **{m.team1_name} vs {m.team2_name}** at **{m.time_str}**. Need replacement."
-
-        await self._log_and_refresh(interaction, note)
-
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.disabled = True
+        # update staff message with new time
+        new_content = self._build_staff_message(guild)
         try:
-            await interaction.message.edit(view=self)
+            await interaction.message.edit(content=new_content, view=self)
         except Exception:
             pass
-        self.stop()
+
+        await interaction.response.send_message("Picked a new time.", ephemeral=True)
 
 
-async def dm_user_safe(user: discord.User | discord.Member, content: str, view: discord.ui.View):
-    try:
-        await user.send(content, view=view)
-    except Exception:
-        pass
+class SubmitTimeModal(discord.ui.Modal, title="Submit Match Time"):
+    week = discord.ui.TextInput(label="WEEK", required=True)
+    time = discord.ui.TextInput(label="Time", required=True)
+    team1 = discord.ui.TextInput(label="Team 1 (mention/name/id)", required=True)
+    team2 = discord.ui.TextInput(label="Team 2 (mention/name/id)", required=True)
 
-async def send_scrim_alerts_if_due(bot: commands.Bot):
-    now = datetime.now(timezone.utc)
+    def _resolve_team(self, guild: discord.Guild, raw: str) -> tuple[Optional[discord.Role], str, str]:
+        text = raw.strip()
 
-    for m in list(MATCHES.values()):
-        # Only process if starts_at_utc is valid
-        if not isinstance(m.starts_at_utc, datetime):
-            continue
-
-        delta = m.starts_at_utc - now
-        if delta > timedelta(minutes=10):
-            continue
-        if delta < timedelta(minutes=-60):
-            continue  # too old; ignore
-
-        guild = bot.get_guild(m.guild_id)
-        if not guild:
-            continue
-
-        # MAIN alerts (once)
-        if not m.alerted_main:
-            main_targets: List[tuple[RoleType, int, bool]] = []
-            if m.ref_main: main_targets.append(("ref", m.ref_main, False))
-            if m.caster_main: main_targets.append(("caster", m.caster_main, False))
-            for uid in m.comm_main:
-                main_targets.append(("commentator", uid, False))
-
-            for role_type, uid, is_backup in main_targets:
-                user = bot.get_user(uid) or await bot.fetch_user(uid)
-                view = ScrimAlertDMView(m.match_id, role_type, is_backup, uid)
-                await dm_user_safe(user, MAIN_ALERT_TEXT, view)
-
-            m.alerted_main = True
-
-        # BACKUP alerts (once)
-        if not m.alerted_backup:
-            backup_targets: List[tuple[RoleType, int, bool]] = []
-            if m.ref_backup: backup_targets.append(("ref", m.ref_backup, True))
-            if m.caster_backup: backup_targets.append(("caster", m.caster_backup, True))
-            for uid in m.comm_backup:
-                backup_targets.append(("commentator", uid, True))
-
-            for role_type, uid, is_backup in backup_targets:
-                user = bot.get_user(uid) or await bot.fetch_user(uid)
-                view = ScrimAlertDMView(m.match_id, role_type, is_backup, uid)
-                await dm_user_safe(user, BACKUP_ALERT_TEXT, view)
-
-            m.alerted_backup = True
-
-
-class ScrimAlertLoop(commands.Cog):
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
-        self.task = bot.loop.create_task(self._loop())
-
-    async def _loop(self):
-        await self.bot.wait_until_ready()
-        while not self.bot.is_closed():
+        # 1) Mention: <@&123>
+        if text.startswith("<@&") and text.endswith(">"):
             try:
-                await send_scrim_alerts_if_due(self.bot)
+                rid = int(text.strip("<@&>"))
+                r = guild.get_role(rid)
+                if r:
+                    return r, r.mention, r.name
             except Exception:
                 pass
-            await asyncio.sleep(30)  # check twice a minute
 
-
-
-
-# ---------------- FIXED TimeAcceptView ----------------
-
-from datetime import datetime, timezone
-import discord
-
-
-class TimeAcceptView(discord.ui.View):
-    def __init__(
-        self,
-        *,
-        team1_role: RoleType,
-        team2_role: RoleType,
-        team1_mention: str,
-        team2_mention: str,
-        team1_name: str,
-        team2_name: str,
-        time_str: str,
-        starts_at_utc: datetime,
-        timeout: float | None = 3600,
-    ):
-        super().__init__(timeout=timeout)
-
-        self.team1_role = team1_role
-        self.team2_role = team2_role
-        self.team1_mention = team1_mention
-        self.team2_mention = team2_mention
-        self.team1_name = team1_name
-        self.team2_name = team2_name
-        self.time_str = time_str
-        self.starts_at_utc = starts_at_utc
-
-    @discord.ui.button(
-        label="Accept Time",
-        style=discord.ButtonStyle.success,
-        custom_id="time_accept",
-    )
-    async def accept_time(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ):
-        if interaction.guild is None:
-            await interaction.response.send_message(
-                "This button can only be used inside a server.",
-                ephemeral=True,
-            )
-            return
-
-        # Disable the buttons after acceptance
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.disabled = True
-
-        # Create the assignment using your existing function
+        # 2) Raw ID: 1234567890
         try:
-            await post_single_assignment_message(
-                guild=interaction.guild,
-                team1_role=self.team1_role,
-                team2_role=self.team2_role,
-                team1_mention=self.team1_mention,
-                team2_mention=self.team2_mention,
-                team1_name=self.team1_name,
-                team2_name=self.team2_name,
-                time_str=self.time_str,
-                starts_at_utc=self.starts_at_utc,
-            )
-        except Exception as exc:
-            print(f"Failed to create assignment: {exc}")
+            rid = int(text)
+            r = guild.get_role(rid)
+            if r:
+                return r, r.mention, r.name
+        except Exception:
+            pass
 
-            await interaction.response.send_message(
-                "The time was accepted, but the assignment could not be created.",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.edit_message(
-            content=(
-                f"✅ Match time accepted: **{self.time_str}**\n\n"
-                f"{self.team1_mention} vs {self.team2_mention}"
-            ),
-            view=self,
+        # 3) Direct role name match (case-insensitive)
+        r = (
+            discord.utils.get(guild.roles, name=text)
+            or discord.utils.find(lambda rr: rr.name.lower() == text.lower(), guild.roles)
         )
+        if r:
+            return r, r.mention, r.name
 
-    @discord.ui.button(
-        label="Reject Time",
-        style=discord.ButtonStyle.danger,
-        custom_id="time_reject",
-    )
-    async def reject_time(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ):
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.disabled = True
+        # 4) Fallback: look in teams.json by team "name" field
+        try:
+            teams = load_teams()  # uses your existing helper
+        except Exception:
+            teams = []
 
-        await interaction.response.edit_message(
-            content="❌ Match time rejected.",
-            view=self,
-        )
+        text_lower = text.lower()
+        matched_role = None
 
+        for entry in teams:
+            t_name = str(entry.get("name", "")).strip()
+            rid = entry.get("role_id")
+            if not t_name or not rid:
+                continue
+            if t_name.lower() != text_lower:   # exact case-insensitive match on team name
+                continue
+            try:
+                rid_int = int(rid)
+            except Exception:
+                continue
+            r = guild.get_role(rid_int)
+            if r:
+                matched_role = r
+                break
 
-class TimeAcceptModal(discord.ui.Modal, title="Accept Match Time"):
-    confirmed_time = discord.ui.TextInput(
-        label="Confirm or change the time",
-        placeholder="Example: Friday at 8:00 PM UTC",
-        required=True,
-        max_length=100,
-    )
+        if matched_role:
+            return matched_role, matched_role.mention, matched_role.name
 
-    def __init__(
-        self,
-        *,
-        team1_role: RoleType,
-        team2_role: RoleType,
-        team1_mention: str,
-        team2_mention: str,
-        team1_name: str,
-        team2_name: str,
-        time_str: str,
-        starts_at_utc: datetime,
-    ):
-        super().__init__()
-
-        self.team1_role = team1_role
-        self.team2_role = team2_role
-        self.team1_mention = team1_mention
-        self.team2_mention = team2_mention
-        self.team1_name = team1_name
-        self.team2_name = team2_name
-        self.time_str = time_str
-        self.starts_at_utc = starts_at_utc
-
-        self.confirmed_time.default = time_str
+        # 5) Nothing matched: return the raw text as display + name, no ping
+        return None, text, text
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Do not pass guild=... here.
-        # TimeAcceptView obtains the guild from interaction.guild.
-        view = TimeAcceptView(
-            team1_role=self.team1_role,
-            team2_role=self.team2_role,
-            team1_mention=self.team1_mention,
-            team2_mention=self.team2_mention,
-            team1_name=self.team1_name,
-            team2_name=self.team2_name,
-            time_str=str(self.confirmed_time.value),
-            starts_at_utc=self.starts_at_utc,
-        )
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            return
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message("This modal must be used in a text channel.", ephemeral=True)
+            return
 
-        await interaction.response.send_message(
-            (
-                f"Proposed match time: **{self.confirmed_time.value}**\n"
-                f"{self.team1_mention} vs {self.team2_mention}\n\n"
-                "Accept this time?"
-            ),
-            view=view,
-        )
+        team1_role, team1_mention, team1_name = self._resolve_team(guild, self.team1.value)
+        team2_role, team2_mention, team2_name = self._resolve_team(guild, self.team2.value)
 
-# ---------------- UPDATED ForceTimeView ----------------
+        stage_raw = self.week.value.strip()
+        stage_l = stage_raw.lower()
+        if "final" in stage_l:
+            header = "# FINALS"
+            special = True
+        elif "semi" in stage_l:
+            header = "# SEMIFINALS"
+            special = True
+        else:
+            header = None
+            special = False
 
-# -----------------------------
-# Time parsing and UTC handling
-# -----------------------------
-
-from datetime import datetime, timezone
-import discord
-
-
-def ensure_utc(value: datetime | None) -> datetime | None:
-    """Return a timezone-aware UTC datetime."""
-    if value is None:
-        return None
-
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-
-    return value.astimezone(timezone.utc)
-
-
-def parse_match_time(value: str) -> datetime:
-    """
-    Parse:
-        YYYY-MM-DD HH:MM UTC
-    Example:
-        2026-08-20 19:30 UTC
-    """
-    text = value.strip().upper().replace(" UTC", "")
-
-    parsed = datetime.strptime(text, "%Y-%m-%d %H:%M")
-    return parsed.replace(tzinfo=timezone.utc)
-
-
-class SubmitTimeModal(discord.ui.Modal, title="Submit Match Details"):
-    week = discord.ui.TextInput(
-        label="Week",
-        placeholder="Example: Week 3",
-        required=True,
-        max_length=50,
-    )
-
-    match_time = discord.ui.TextInput(
-        label="Match time",
-        placeholder="YYYY-MM-DD HH:MM UTC",
-        required=True,
-        max_length=40,
-    )
-
-    team1_name_input = discord.ui.TextInput(
-        label="Team 1 name",
-        placeholder="Enter team 1 name",
-        required=True,
-        max_length=100,
-    )
-
-    team2_name_input = discord.ui.TextInput(
-        label="Team 2 name",
-        placeholder="Enter team 2 name",
-        required=True,
-        max_length=100,
-    )
-
-    def __init__(
-        self,
-        *,
-        parent_view: "ForceTimeView",
-        original_message: discord.Message | None = None,
-    ):
-        super().__init__()
-
-        self.parent_view = parent_view
-        self.original_message = original_message
-
-        # Pre-fill the modal with the values currently held by ForceTimeView.
-        self.week.default = str(parent_view.week or "")
-
-        if parent_view.starts_at_utc:
-            current_time = ensure_utc(parent_view.starts_at_utc)
-            self.match_time.default = current_time.strftime(
-                "%Y-%m-%d %H:%M UTC"
+        if special:
+            content = (
+                f"{header}\n"
+                f"> Teams: {team1_mention} vs {team2_mention}\n"
+                f"> Time: {self.time.value}\n"
+                f"> Referee: \n"
+                f"> Caster: "
             )
         else:
-            self.match_time.default = ""
-
-        self.team1_name_input.default = parent_view.team1_name or ""
-        self.team2_name_input.default = parent_view.team2_name or ""
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            starts_at_utc = parse_match_time(str(self.match_time.value))
-        except ValueError:
-            await interaction.response.send_message(
-                "Invalid time format. Use `YYYY-MM-DD HH:MM UTC`.",
-                ephemeral=True,
-            )
-            return
-
-        self.parent_view.week = str(self.week.value).strip()
-        self.parent_view.starts_at_utc = starts_at_utc
-        self.parent_view.time_str = starts_at_utc.strftime(
-            "%A, %B %d at %I:%M %p UTC"
-        )
-        self.parent_view.team1_name = str(
-            self.team1_name_input.value
-        ).strip()
-        self.parent_view.team2_name = str(
-            self.team2_name_input.value
-        ).strip()
-
-        await interaction.response.edit_message(
-            content=self.parent_view._build_staff_message(
-                interaction.guild
-            ),
-            view=self.parent_view,
-        )
-
-
-class ForceTimeView(discord.ui.View):
-    def __init__(
-        self,
-        *,
-        team1_role: discord.Role | None,
-        team2_role: discord.Role | None,
-        team1_mention: str,
-        team2_mention: str,
-        team1_name: str,
-        team2_name: str,
-        time_str: str,
-        starts_at_utc: datetime,
-        week: str = "",
-    ):
-        super().__init__(timeout=900)
-
-        self.team1_role = team1_role
-        self.team2_role = team2_role
-
-        self.team1_mention = team1_mention
-        self.team2_mention = team2_mention
-
-        self.team1_name = team1_name
-        self.team2_name = team2_name
-
-        self.time_str = time_str
-        self.starts_at_utc = ensure_utc(starts_at_utc)
-        self.week = week
-
-        self.original_message: discord.Message | None = None
-
-    def _build_staff_message(self, guild: discord.Guild | None) -> str:
-        team1_role_text = (
-            self.team1_role.mention
-            if self.team1_role
-            else self.team1_mention
-        )
-
-        team2_role_text = (
-            self.team2_role.mention
-            if self.team2_role
-            else self.team2_mention
-        )
-
-        return (
-            "## Forced Match Review\n\n"
-            f"**Week:** {self.week or 'Not selected'}\n"
-            f"**Time:** {self.time_str or 'Not selected'}\n"
-            f"**Team 1:** {self.team1_name} {team1_role_text}\n"
-            f"**Team 2:** {self.team2_name} {team2_role_text}\n\n"
-            "Staff: use **Submit Time** to edit the match details, "
-            "or choose **Accept** / **Deny**."
-        )
-
-    @discord.ui.button(
-        label="Submit Time",
-        style=discord.ButtonStyle.primary,
-        custom_id="force_time_submit",
-    )
-    async def submit_time(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ):
-        try:
-            modal = SubmitTimeModal(
-                parent_view=self,
-                original_message=interaction.message,
+            content = (
+                f"{team1_mention} vs {team2_mention}\n"
+                f"Team staff must accept this match.\n"
+                f"> WEEK: {self.week.value}\n"
+                f"> Time: {self.time.value}\n"
+                f"> Team 1: \n"
+                f"> Team 2: "
             )
 
-            await interaction.response.send_modal(modal)
+        view = TimeAcceptView(
+            guild=guild,
+            team1_role=team1_role,
+            team2_role=team2_role,
+            team1_name=team1_name,
+            team2_name=team2_name,
+            week=self.week.value,
+            time=self.time.value,
+        )
 
+        try:
+            sent = await channel.send(content, view=view)
+            view.origin_message = sent
+            await interaction.response.send_message("Match time request posted.", ephemeral=True)
         except Exception:
-            logger.exception("Could not open SubmitTimeModal")
-
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "Could not open the time submission form.",
-                    ephemeral=True,
-                )
-
-    @discord.ui.button(
-        label="Accept",
-        style=discord.ButtonStyle.success,
-        custom_id="force_time_accept",
-    )
-    async def accept(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ):
-        if self.starts_at_utc is None:
-            await interaction.response.send_message(
-                "A match start time must be submitted first.",
-                ephemeral=True,
-            )
-            return
-
-        self.starts_at_utc = ensure_utc(self.starts_at_utc)
-
-        # Disable the buttons after acceptance.
-        for child in self.children:
-            child.disabled = True
-
-        await interaction.response.edit_message(
-            content=(
-                "✅ **Forced match accepted.**\n\n"
-                f"**Week:** {self.week or 'N/A'}\n"
-                f"**Time:** {self.time_str}\n"
-                f"**Team 1:** {self.team1_name}\n"
-                f"**Team 2:** {self.team2_name}"
-            ),
-            view=self,
-        )
-
-        # Call your scheduling function here, using its actual signature.
-        #
-        # Example:
-        #
-        # await post_single_assignment_message(
-        #     guild=interaction.guild,
-        #     starts_at_utc=self.starts_at_utc,
-        #     team1_role=self.team1_role,
-        #     team2_role=self.team2_role,
-        #     team1_name=self.team1_name,
-        #     team2_name=self.team2_name,
-        # )
-
-    @discord.ui.button(
-        label="Deny",
-        style=discord.ButtonStyle.danger,
-        custom_id="force_time_deny",
-    )
-    async def deny(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ):
-        for child in self.children:
-            child.disabled = True
-
-        await interaction.response.edit_message(
-            content="❌ **Forced match denied.**",
-            view=self,
-        )
-
-# -----------------------------
-# Admin panel view
-# -----------------------------
-
-class AdminPanelView(discord.ui.View):
-    def __init__(
-        self,
-        *,
-        team1_role: Optional[discord.Role] = None,
-        team2_role: Optional[discord.Role] = None,
-        team1_name: Optional[str] = None,
-        team2_name: Optional[str] = None,
-        team1_mention: Optional[str] = None,
-        team2_mention: Optional[str] = None,
-        starts_at_utc: Optional[datetime] = None,
-        timeout: float = 900,
-    ):
-        super().__init__(timeout=timeout)
-
-        self.team1_role = team1_role
-        self.team2_role = team2_role
-        self.team1_name = team1_name
-        self.team2_name = team2_name
-        self.team1_mention = team1_mention
-        self.team2_mention = team2_mention
-        self.starts_at_utc = (
-            ensure_utc(starts_at_utc)
-            if starts_at_utc is not None
-            else None
-        )
-
-    @discord.ui.button(
-        label="Submit Match Time",
-        style=discord.ButtonStyle.success,
-        emoji="🕒",
-    )
-    async def submit_time(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        try:
-            # The modal receives all state currently held by the view.
-            modal = SubmitTimeModal(
-                team1_role=self.team1_role,
-                team2_role=self.team2_role,
-                team1_name=self.team1_name,
-                team2_name=self.team2_name,
-                team1_mention=self.team1_mention,
-                team2_mention=self.team2_mention,
-                starts_at_utc=self.starts_at_utc,
-                original_message=interaction.message,
-            )
-
-            await interaction.response.send_modal(modal)
-
-        except Exception:
-            logger.exception("Could not open SubmitTimeModal")
-
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "Unable to open the match-time form.",
-                    ephemeral=True,
-                )
-
-    @discord.ui.button(
-        label="Cancel",
-        style=discord.ButtonStyle.danger,
-        emoji="✖️",
-    )
-    async def cancel(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        for child in self.children:
-            child.disabled = True
-
-        await interaction.response.edit_message(
-            content="Match-time submission cancelled.",
-            view=self,
-        )
-
-        self.stop()
-
-    async def on_timeout(self) -> None:
-        for child in self.children:
-            child.disabled = True
+            await interaction.response.send_message("Failed to post match time (missing perms?).", ephemeral=True)
 
 
 def resolve_team_any(guild: discord.Guild, raw: str) -> tuple[Optional[discord.Role], str, str]:
@@ -3940,252 +4680,116 @@ class SaySomethingCog(commands.Cog):
 
 
 # ---------------- ForceTimeAutoWarnCog ----------------
-
-def generate_forced_time() -> tuple[str, datetime]:
-    """
-    Generate a random forced match time.
-
-    Returns:
-        tuple[str, datetime]:
-            - Human-readable time string
-            - Timezone-aware UTC datetime
-    """
-
-    now_utc = datetime.now(timezone.utc)
-
-    # Choose a date 1–5 days from now.
-    match_date = (now_utc + timedelta(days=random.randint(1, 5))).date()
-
-    # Allowed times: 18:00 through 22:00 UTC, every 30 minutes.
-    minute_offset = random.randint(0, 8) * 30
-    hour = 18 + (minute_offset // 60)
-    minute = minute_offset % 60
-
-    starts_at_utc = datetime(
-        year=match_date.year,
-        month=match_date.month,
-        day=match_date.day,
-        hour=hour,
-        minute=minute,
-        tzinfo=timezone.utc,
-    )
-
-    # Prevent accidentally generating a time in the past.
-    if starts_at_utc <= now_utc:
-        starts_at_utc += timedelta(days=1)
-
-    time_str = starts_at_utc.strftime(
-        "%A, %B %d at %I:%M %p UTC"
-    )
-
-    return time_str, starts_at_utc
-
-
 class ForceTimeAutoWarnCog(commands.Cog):
-    """
-    Sends automatic warnings before a forced match begins.
-
-    Usage:
-
-        auto_warn_cog = ForceTimeAutoWarnCog(
-            bot,
-            warning_channel_id=123456789012345678,
-        )
-        await bot.add_cog(auto_warn_cog)
-
-    Then, after creating a forced match:
-
-        cog = bot.get_cog("ForceTimeAutoWarnCog")
-
-        if cog:
-            cog.schedule_warning(
-                guild_id=guild.id,
-                starts_at_utc=starts_at_utc,
-                team1_mention=t1_mention,
-                team2_mention=t2_mention,
-            )
-    """
-
-    def __init__(
-        self,
-        bot: commands.Bot,
-        warning_channel_id: int,
-        *,
-        warning_minutes: int = 30,
-    ):
-        self.bot = bot
-        self.warning_channel_id = warning_channel_id
-        self.warning_minutes = warning_minutes
-
-        self._warning_tasks: set[asyncio.Task] = set()
-
-    def cog_unload(self) -> None:
-        """Cancel active warning tasks when the cog unloads."""
-        for task in self._warning_tasks:
-            task.cancel()
-
-        self._warning_tasks.clear()
-
-    @staticmethod
-    def _ensure_utc(value: datetime) -> datetime:
-        """Ensure a datetime is timezone-aware and converted to UTC."""
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-
-        return value.astimezone(timezone.utc)
-
-    def schedule_warning(
-        self,
-        *,
-        guild_id: int,
-        starts_at_utc: datetime,
-        team1_mention: str,
-        team2_mention: str,
-    ) -> None:
-        """
-        Schedule an automatic warning for a forced match.
-        """
-
-        starts_at_utc = self._ensure_utc(starts_at_utc)
-
-        task = asyncio.create_task(
-            self._warning_worker(
-                guild_id=guild_id,
-                starts_at_utc=starts_at_utc,
-                team1_mention=team1_mention,
-                team2_mention=team2_mention,
-            )
-        )
-
-        self._warning_tasks.add(task)
-        task.add_done_callback(self._warning_tasks.discard)
-
-    async def _warning_worker(
-        self,
-        *,
-        guild_id: int,
-        starts_at_utc: datetime,
-        team1_mention: str,
-        team2_mention: str,
-    ) -> None:
-        warning_time = starts_at_utc - timedelta(
-            minutes=self.warning_minutes
-        )
-
-        seconds_until_warning = (
-            warning_time - datetime.now(timezone.utc)
-        ).total_seconds()
-
-        if seconds_until_warning > 0:
-            await asyncio.sleep(seconds_until_warning)
-
-        channel = self.bot.get_channel(self.warning_channel_id)
-
-        if channel is None:
-            try:
-                channel = await self.bot.fetch_channel(
-                    self.warning_channel_id
-                )
-            except discord.HTTPException:
-                logger.exception(
-                    "Could not fetch force-time warning channel."
-                )
-                return
-
-        if not isinstance(channel, discord.TextChannel):
-            logger.error(
-                "Configured warning channel is not a text channel."
-            )
-            return
-
-        match_timestamp = int(starts_at_utc.timestamp())
-
-        message = (
-            f"⚠️ **Forced match reminder**\n\n"
-            f"{team1_mention} vs. {team2_mention}\n"
-            f"Match starts <t:{match_timestamp}:R> "
-            f"(<t:{match_timestamp}:F>).\n\n"
-            f"Please be ready."
-        )
-
-        try:
-            await channel.send(
-                message,
-                allowed_mentions=discord.AllowedMentions(
-                    roles=True,
-                    users=True,
-                    everyone=False,
-                ),
-            )
-        except discord.HTTPException:
-            logger.exception(
-                "Failed to send force-time warning."
-            )
-
-
-
-
-class ScrimCheckCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.check_channels.start()
 
-    @app_commands.guilds(Object(id=TEST_GUILD_ID))
-    @app_commands.command(
-        name="check-scrims",
-        description="Check currently scheduled scrims.",
-    )
-    async def check_scrims(self, interaction: discord.Interaction):
-        guild = interaction.guild
-        if guild is None:
-            await interaction.response.send_message(
-                "Use this in a server.",
-                ephemeral=True,
-            )
-            return
+    def cog_unload(self):
+        self.check_channels.cancel()
 
-        cat = guild.get_channel(SCRIM_CATEGORY_ID)
-        if not isinstance(cat, discord.CategoryChannel):
-            await interaction.response.send_message(
-                "Scrim category is not configured.",
-                ephemeral=True,
-            )
-            return
+    @tasks.loop(hours=1)
+    async def check_channels(self):
+        """
+        Every hour:
+        - Look for scheduling channels (name contains '-vs-').
+        - If channel is older than FORCE_WARN_DAYS and not yet warned:
+          * Send a warning message.
+          * Mark topic with FORCE_WARN_MARKER (⚠️ by default).
+          * Prefix the channel name with ⚠️ so it’s visually clear the bot is forcing/scheduling.
+        """
+        now = datetime.utcnow()
 
-        # All text channels inside the scrim category
-        scrim_channels = [
-            ch for ch in cat.channels
-            if isinstance(ch, discord.TextChannel)
-        ]
+        for guild in self.bot.guilds:
+            for ch in guild.text_channels:
+                name = ch.name or ""
+                topic = ch.topic or ""
 
-        if not scrim_channels:
-            await interaction.response.send_message(
-                "No scrims scheduled.",
-                ephemeral=True,
-            )
-            return
+                # Only consider scheduling-style channels: name contains "-vs-"
+                if "-vs-" not in name.lower():
+                    continue
 
-        # Sort by creation time (oldest first)
-        scrim_channels.sort(key=lambda c: c.created_at)
+                # Skip if already warned (marker in topic)
+                if FORCE_WARN_MARKER in (topic or ""):
+                    continue
 
-        lines = ["Current scrims:\n"]
-        for ch in scrim_channels:
-            # created_at is in UTC; you can adjust if you want
-            created = ch.created_at.strftime("%m/%d/%y %I:%M%p UTC")
-            # Try to show a nice label: topic or channel name
-            label = ch.topic or ch.name
-            lines.append(f"> {ch.mention} — {label} — created {created}")
+                # Check age (UTC)
+                created_utc = ch.created_at.replace(tzinfo=None)
+                age_days = (now - created_utc).days
+                if age_days < FORCE_WARN_DAYS:
+                    continue
 
-        await interaction.response.send_message(
-            "\n".join(lines),
-            ephemeral=True,
-        )
+                # Try to get team names from topic: "Team1 Vs Team2"
+                t1_name = None
+                t2_name = None
 
+                if topic and " Vs " in topic:
+                    parts = topic.split(" Vs ", 1)
+                    if len(parts) == 2:
+                        t1_name = parts[0].strip()
+                        t2_name = parts[1].strip()
+
+                # If topic failed, fallback: parse from channel name "team1-vs-team2"
+                if not t1_name or not t2_name:
+                    lower_name = name.lower()
+                    if "-vs-" in lower_name:
+                        p1, p2 = lower_name.split("-vs-", 1)
+                        t1_name = p1.replace("-", " ").strip()
+                        t2_name = p2.replace("-", " ").strip()
+
+                if not t1_name or not t2_name:
+                    # Can't parse team names; skip this channel
+                    continue
+
+                # Resolve to roles or keep plain text
+                t1_role, t1_mention, _ = resolve_team_any(guild, t1_name)
+                t2_role, t2_mention, _ = resolve_team_any(guild, t2_name)
+
+                # Build and send the warning message
+                warn_msg = (
+                    f"{t1_mention} {t2_mention} "
+                    "You Have Ran Out Of Time To Schedule. A Time Has Been Forced, "
+                    "Meaning If One Player From One Team Joins Before The 15 Minute Late Time, That Team Will Win."
+                )
+                try:
+                    await ch.send(warn_msg)
+                except Exception:
+                    # If we can't send a message, don't try to edit name/topic either
+                    continue
+
+                # Mark as warned by updating topic
+                new_topic = (topic or "").strip()
+                if FORCE_WARN_MARKER not in new_topic:
+                    new_topic = (new_topic + " " + FORCE_WARN_MARKER).strip()
+
+                try:
+                    await ch.edit(topic=new_topic, reason="Force-time auto warning sent")
+                except Exception:
+                    # Topic edit failed; continue with name attempt anyway
+                    pass
+
+                # Also prefix the channel name with the warning emoji so users know
+                # that the bot had to step in and schedule/force this match.
+                try:
+                    old_name = ch.name or ""
+                    if not old_name.startswith(FORCE_WARN_MARKER):
+                        new_name = f"{FORCE_WARN_MARKER}{old_name}"
+                        # Discord hard limit is 100 chars; trim if needed
+                        if len(new_name) > 100:
+                            new_name = new_name[:100]
+                        await ch.edit(name=new_name, reason="Mark channel as force-time scheduled")
+                except Exception:
+                    # Best-effort; do not crash the loop
+                    pass
+
+    @check_channels.before_loop
+    async def before_check_channels(self):
+        await self.bot.wait_until_ready()
 
 
 
 
 # ---------------- ForceTimeCog ----------------
-
 class ForceTimeCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -4197,91 +4801,36 @@ class ForceTimeCog(commands.Cog):
         description="Force a match time between two teams (admins only).",
     )
     @app_commands.describe(
-        team1="Team 1 (mention / name / ID)",
-        team2="Team 2 (mention / name / ID)",
+        team1="Team 1 (mention / name / id)",
+        team2="Team 2 (mention / name / id)",
     )
-    async def force_time(
-        self,
-        interaction: discord.Interaction,
-        team1: str,
-        team2: str,
-    ):
+    async def force_time(self, interaction: discord.Interaction, team1: str, team2: str):
         guild = interaction.guild
-
         if guild is None:
-            await interaction.response.send_message(
-                "Use this command in a server.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
             return
 
         if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message(
-                "You do not have permission to use this command.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
             return
 
-        # Resolve both teams
-        try:
-            t1_role, t1_mention, t1_name = resolve_team_any(guild, team1)
-            t2_role, t2_mention, t2_name = resolve_team_any(guild, team2)
-        except Exception:
-            await interaction.response.send_message(
-                "There was an error while resolving the teams.",
-                ephemeral=True,
-            )
+        # resolve teams
+        t1_role, t1_mention, t1_name = resolve_team_any(guild, team1)
+        t2_role, t2_mention, t2_name = resolve_team_any(guild, team2)
+
+        if not t1_mention or not t2_mention:
+            await interaction.response.send_message("Could not resolve one or both teams.", ephemeral=True)
             return
 
-        if not t1_mention or not t1_name:
-            await interaction.response.send_message(
-                f"Could not resolve Team 1: `{team1}`",
-                ephemeral=True,
-            )
-            return
+        # pick an initial forced time
+        time_str = generate_forced_time_string()
 
-        if not t2_mention or not t2_name:
-            await interaction.response.send_message(
-                f"Could not resolve Team 2: `{team2}`",
-                ephemeral=True,
-            )
-            return
-
-        if t1_name.lower() == t2_name.lower():
-            await interaction.response.send_message(
-                "Team 1 and Team 2 must be different teams.",
-                ephemeral=True,
-            )
-            return
-
-        # Generate both the display text and the real UTC match time.
-        # The datetime is required by the 10-minute alert system.
-        try:
-            time_str, starts_at_utc = generate_forced_time()
-        except Exception:
-            await interaction.response.send_message(
-                "Failed to generate a forced match time.",
-                ephemeral=True,
-            )
-            return
-
-        # Ensure the datetime is timezone-aware UTC.
-        if starts_at_utc.tzinfo is None:
-            starts_at_utc = starts_at_utc.replace(tzinfo=timezone.utc)
-        else:
-            starts_at_utc = starts_at_utc.astimezone(timezone.utc)
-
-        # Find the staff review channel.
+        # staff review channel (fixed)
         review_ch = guild.get_channel(FORCE_TIME_REVIEW_CHANNEL_ID)
-
         if not isinstance(review_ch, discord.TextChannel):
-            await interaction.response.send_message(
-                "The force-time review channel is not configured correctly.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("Review channel is not configured correctly.", ephemeral=True)
             return
 
-        # Create the Accept/Deny view.
         view = ForceTimeView(
             team1_role=t1_role,
             team2_role=t2_role,
@@ -4290,42 +4839,18 @@ class ForceTimeCog(commands.Cog):
             team1_name=t1_name,
             team2_name=t2_name,
             time_str=time_str,
-            starts_at_utc=starts_at_utc,
         )
 
-        # Build the staff review message.
         staff_message = view._build_staff_message(guild)
 
         try:
-            await review_ch.send(
-                content=staff_message,
-                view=view,
-            )
-        except discord.Forbidden:
-            await interaction.response.send_message(
-                "I do not have permission to post in the review channel.",
-                ephemeral=True,
-            )
-            return
-        except discord.HTTPException:
-            await interaction.response.send_message(
-                "Discord rejected the review message.",
-                ephemeral=True,
-            )
-            return
+            await review_ch.send(staff_message, view=view)
         except Exception:
-            await interaction.response.send_message(
-                "Failed to post the force-time review message.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("Failed to post review message.", ephemeral=True)
             return
 
         await interaction.response.send_message(
-            (
-                f"Forced time created for {t1_mention} vs {t2_mention}.\n"
-                f"Proposed time: **{time_str}**\n"
-                f"Staff approval was sent to {review_ch.mention}."
-            ),
+            f"Proposed forced time created for {t1_mention} vs {t2_mention} and sent to {review_ch.mention}.",
             ephemeral=True,
         )
 
@@ -4356,6 +4881,22 @@ class HeadsetInfoCog(commands.Cog):
             color=discord.Color.blue(),
         )
         return embed
+
+    # ---------- Prefix command: !headsets (public) ----------
+    @commands.command(name="headsets")
+    async def headsets_prefix(self, ctx: commands.Context):
+        embed = self._build_headset_embed()
+
+        # delete the user’s command message (optional but you requested earlier)
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
+
+        try:
+            await ctx.send(embed=embed)
+        except Exception:
+            pass
 
     # ---------- Slash command: /headsets (ephemeral) ----------
     @app_commands.guilds(Object(id=TEST_GUILD_ID))
@@ -4521,28 +5062,60 @@ class ManageTeam(commands.Cog):
             return
 
         member = interaction.user
-        team_role = get_user_team_role(member)
+
+        # Use the new, more robust helper
+        team_role = find_member_team_role(member)
         if team_role is None:
             await interaction.response.send_message("You are not on a team.", ephemeral=True)
             return
 
         data = await get_team_data(team_role, guild)
 
+        max_roster = CONFIG.get("roster_rules", {}).get("max_roster", 12)
         embed_color = team_role.colour if getattr(team_role, "colour", None) else discord.Color.blurple()
-        embed = discord.Embed(title=f"Roster for {data['name']}", description="Team roster", color=embed_color)
+        embed = discord.Embed(
+            title=f"Roster for {data['name']}",
+            description="Team roster",
+            color=embed_color,
+        )
 
-        embed.add_field(name="Team Executive", value=format_list_arrow([data["executive"]]), inline=False)
-        embed.add_field(name="Captain", value=format_list_arrow([data["captain"]]), inline=False)
-        embed.add_field(name="Co-Captains", value=format_list_arrow(data.get("co_captains", [])), inline=False)
+        embed.add_field(
+            name="Team Executive",
+            value=format_list_arrow([data["executive"]]),
+            inline=False,
+        )
+        embed.add_field(
+            name="Captain",
+            value=format_list_arrow([data["captain"]]),
+            inline=False,
+        )
+        embed.add_field(
+            name="Co-Captains",
+            value=format_list_arrow([m.mention for m in data.get("co_captains", [])]),
+            inline=False,
+        )
 
         players = data.get("players", [])
-        player_mentions = [p.mention for p in players[:12]]
-        embed.add_field(name="Players", value=format_list_arrow(player_mentions), inline=False)
+        player_mentions = [p.mention for p in players[:max_roster]]
+        embed.add_field(
+            name="Players",
+            value=format_list_arrow(player_mentions),
+            inline=False,
+        )
+        embed.add_field(
+            name="\u200b",
+            value=f"{len(players)}/{max_roster}",
+            inline=False,
+        )
 
-        embed.add_field(name="\u200b", value=f"{len(players)}/12", inline=False)
         pending = data.get("pending_invites", [])
         pending_text = ", ".join(str(x) for x in pending) if pending else "None"
-        embed.add_field(name="Pending invites", value=pending_text, inline=False)
+        embed.add_field(
+            name="Pending invites",
+            value=pending_text,
+            inline=False,
+        )
+
         embed.set_footer(text=team_role.name)
 
         can_captain = has_role_id(member, CAPTAIN_ROLE_ID)
@@ -4559,6 +5132,9 @@ class ManageTeam(commands.Cog):
                 roster_locked=ROSTER_LOCKED,
                 admin_override=False,
             )
+            # start with action buttons disabled until a member is selected
+            if not (ROSTER_LOCKED and not view.admin_override):
+                view._set_action_buttons_enabled(False)
 
         if view is not None:
             await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
@@ -4673,37 +5249,8 @@ class RosterCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    def _is_team_role(self, guild: discord.Guild, role: discord.Role) -> bool:
-        return is_team_role(guild, role)
-
-    def _build_roster_embed(self, role: discord.Role, data: dict) -> discord.Embed:
-        max_roster = CONFIG.get("roster_rules", {}).get("max_roster", 12)
-        embed_color = role.colour if getattr(role, "colour", None) else discord.Color.dark_green()
-
-        embed = discord.Embed(
-            title=f"Roster for {data['name']}",
-            description="Team roster",
-            color=embed_color,
-        )
-
-        embed.add_field(name="Team Executive", value=format_list_arrow([data["executive"]]), inline=False)
-        embed.add_field(name="Captain",        value=format_list_arrow([data["captain"]]),   inline=False)
-        embed.add_field(name="Co-Captains",    value=format_list_arrow(data.get("co_captains", [])), inline=False)
-
-        players = data.get("players", [])
-        player_mentions = [p.mention for p in players[:max_roster]]
-        embed.add_field(name="Players", value=format_list_arrow(player_mentions), inline=False)
-        embed.add_field(name="\u200b", value=f"{len(players)}/{max_roster}", inline=False)
-
-        pending = data.get("pending_invites", [])
-        pending_text = ", ".join(str(x) for x in pending) if pending else "None"
-        embed.add_field(name="Pending invites", value=pending_text, inline=False)
-
-        embed.set_footer(text=role.name)
-        return embed
-
     @app_commands.guilds(Object(id=TEST_GUILD_ID))
-    @app_commands.command(name="roster", description="Show a team's roster")
+    @app_commands.command(name="roster", description="Show a team's roster.")
     async def roster(self, interaction: discord.Interaction):
         guild = interaction.guild
         if guild is None:
@@ -4712,7 +5259,7 @@ class RosterCog(commands.Cog):
 
         await interaction.response.defer(ephemeral=True)
 
-        # Build list of team roles from teams.json that still exist and look like team roles
+        # build list of candidate team roles from teams.json
         roles: list[discord.Role] = []
         teams_data = load_teams()
         for entry in teams_data:
@@ -4731,29 +5278,53 @@ class RosterCog(commands.Cog):
             await interaction.followup.send("No teams found.", ephemeral=True)
             return
 
-        # helper to build embed for a role
-        def build_embed_for_role(role: discord.Role, data: dict) -> discord.Embed:
-            max_roster = CONFIG.get("roster_rules", {}).get("max_roster", 12)
-            embed_color = role.colour if getattr(role, "colour", None) else discord.Color.dark_green()
+        max_roster = CONFIG.get("roster_rules", {}).get("max_roster", 12)
 
+        async def build_embed_for_role(role: discord.Role) -> discord.Embed:
+            data = await get_team_data(role, guild)
+            embed_color = role.colour if getattr(role, "colour", None) else discord.Color.dark_green()
             embed = discord.Embed(
                 title=f"Roster for {data['name']}",
                 description="Team roster",
                 color=embed_color,
             )
 
-            embed.add_field(name="Team Executive", value=format_list_arrow([data["executive"]]), inline=False)
-            embed.add_field(name="Captain",        value=format_list_arrow([data["captain"]]),   inline=False)
-            embed.add_field(name="Co-Captains",    value=format_list_arrow(data.get("co_captains", [])), inline=False)
+            embed.add_field(
+                name="Team Executive",
+                value=format_list_arrow([data["executive"]]),
+                inline=False,
+            )
+            embed.add_field(
+                name="Captain",
+                value=format_list_arrow([data["captain"]]),
+                inline=False,
+            )
+            embed.add_field(
+                name="Co-Captains",
+                value=format_list_arrow([m.mention for m in data.get("co_captains", [])]),
+                inline=False,
+            )
 
             players = data.get("players", [])
             player_mentions = [p.mention for p in players[:max_roster]]
-            embed.add_field(name="Players", value=format_list_arrow(player_mentions), inline=False)
-            embed.add_field(name="\u200b", value=f"{len(players)}/{max_roster}", inline=False)
+            embed.add_field(
+                name="Players",
+                value=format_list_arrow(player_mentions),
+                inline=False,
+            )
+            embed.add_field(
+                name="\u200b",
+                value=f"{len(players)}/{max_roster}",
+                inline=False,
+            )
 
             pending = data.get("pending_invites", [])
             pending_text = ", ".join(str(x) for x in pending) if pending else "None"
-            embed.add_field(name="Pending invites", value=pending_text, inline=False)
+            embed.add_field(
+                name="Pending invites",
+                value=pending_text,
+                inline=False,
+            )
 
             embed.set_footer(text=role.name)
             return embed
@@ -4780,10 +5351,8 @@ class RosterCog(commands.Cog):
                 await sel_int.response.send_message("Role not found.", ephemeral=True)
                 return
 
-            data = await get_team_data(sel_role, guild)
-            embed = build_embed_for_role(sel_role, data)
+            embed = await build_embed_for_role(sel_role)
 
-            # Edit the original ephemeral message so the dropdown stays under the updated embed
             try:
                 await sel_int.response.edit_message(embed=embed, view=view)
             except Exception:
@@ -4791,19 +5360,23 @@ class RosterCog(commands.Cog):
 
         select.callback = sel_cb
 
-        # If the requester is on a team, we can pre-select it (optional)
+        # if the requester is on a team, put their team first in dropdown
         requester = guild.get_member(interaction.user.id)
-        requester_team = find_single_team_for_member(guild, requester) if requester else None
+        requester_team = get_user_team_role(requester) if requester else None
         if requester_team:
-            # put their team first in the dropdown by reordering options
-            options_sorted = sorted(options, key=lambda o: (0 if o.value == str(requester_team.id) else 1, o.label.lower()))
+            options_sorted = sorted(
+                options,
+                key=lambda o: (0 if o.value == str(requester_team.id) else 1, o.label.lower()),
+            )
             select.options = options_sorted
 
-        # initial embed: prompt user to pick a team
-        prompt_embed = discord.Embed(title="Pick a team", description="Select a team from the dropdown to view its roster.", color=discord.Color.dark_green())
+        prompt_embed = discord.Embed(
+            title="Pick a team",
+            description="Select a team from the dropdown to view its roster.",
+            color=discord.Color.dark_green(),
+        )
 
         await interaction.followup.send(embed=prompt_embed, view=view, ephemeral=True)
-
 
 
 from discord import app_commands
@@ -4911,10 +5484,12 @@ class AdminManage(commands.Cog):
             admin_override=True,
         )
 
-        if view is not None:
-            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-        else:
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+        # start with action buttons disabled until selection (admin can still use them once enabled)
+        view._set_action_buttons_enabled(False)
+
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
 
 
 class InfoCommands(commands.Cog):
@@ -5042,109 +5617,6 @@ class InfoCommands(commands.Cog):
         await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 
-class FAQBracketCog(commands.Cog):
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
-
-    class FAQRoleView(discord.ui.View):
-        def __init__(self):
-            super().__init__(timeout=None)
-
-        async def _toggle_role_id(self, interaction: discord.Interaction, role_id: int, label: str):
-            guild = interaction.guild
-            if guild is None or not role_id:
-                await interaction.response.send_message("That role is not configured.", ephemeral=True)
-                return
-
-            role = guild.get_role(role_id)
-            if not role:
-                await interaction.response.send_message("Configured role not found on this server.", ephemeral=True)
-                return
-
-            member = guild.get_member(interaction.user.id)
-            if member is None:
-                await interaction.response.send_message("Could not resolve your member object.", ephemeral=True)
-                return
-
-            if role in member.roles:
-                try:
-                    await member.remove_roles(role, reason="FAQ role toggle")
-                    await interaction.response.send_message(f"Removed {label}.", ephemeral=True)
-                except Exception:
-                    await interaction.response.send_message("Could not remove role (missing perms).", ephemeral=True)
-            else:
-                try:
-                    await member.add_roles(role, reason="FAQ role toggle")
-                    await interaction.response.send_message(f"Added {label}.", ephemeral=True)
-                except Exception:
-                    await interaction.response.send_message("Could not add role (missing perms).", ephemeral=True)
-
-
-        @discord.ui.button(label="🚀 Unborn Captain", style=discord.ButtonStyle.secondary, custom_id="faq_unborn")
-        async def faq_unborn(self, interaction: discord.Interaction, button: discord.ui.Button):
-            await self._toggle_role_id(interaction, UNBORN_CAPTAIN_ROLE_ID, "Unborn Captain")
-
-        @discord.ui.button(label="🎉 Event Ping", style=discord.ButtonStyle.secondary, custom_id="faq_event")
-        async def faq_event(self, interaction: discord.Interaction, button: discord.ui.Button):
-            await self._toggle_role_id(interaction, EVENT_PING_ROLE_ID, "Event Ping")
-
-        @discord.ui.button(label="🦓 Scrim Referee", style=discord.ButtonStyle.secondary, custom_id="faq_scrim_ref")
-        async def faq_scrim_ref(self, interaction: discord.Interaction, button: discord.ui.Button):
-            await self._toggle_role_id(interaction, SCRIM_REFEREE_ROLE_ID, "Scrim Referee")
-
-    @app_commands.guilds(Object(id=TEST_GUILD_ID))
-    @app_commands.default_permissions(administrator=True)
-    @app_commands.command(name="faq", description="Post the FAQ message to the FAQ channel (or here)")
-    async def faq(self, interaction: discord.Interaction):
-        guild = interaction.guild
-        if guild is None:
-            await interaction.response.send_message("Use this in a server.", ephemeral=True)
-            return
-
-        faq_ch_id = CONFIG.get("channels", {}).get("faq")
-        channel = guild.get_channel(faq_ch_id) if faq_ch_id else interaction.channel
-        if not isinstance(channel, discord.TextChannel):
-            await interaction.response.send_message("Could not resolve FAQ channel.", ephemeral=True)
-            return
-
-        content = (
-            "# Pro Gorilla League Frequently Asked Questions\n\n"
-            "## • How can I make a team/How do I get it official?\n\n"
-            "> **Making a team is quite easy,**\n"
-            "> - Simply make a discord for your team, and use recruitment-center,\n"
-            "> - Getting your team official is another challenge however,\n"
-            "> **The first step to getting your team official is getting unborn captain role!,**\n"
-            "> - We will use <#1409042326042578984> to update you on our team situation! We pick the best teams we can from out forms, so make sure you are active and competitive!\n"
-            "> - Teams normally get selected at the start of a new season or replacing an older team during seeding season,\n"
-            "> **If you are interested, use our auto roles to join!**\n\n"
-            "## • Moderation Support\n\n"
-            "> - If you have any reports of players, please open a ticket so the moderation team can tend to it,\n"
-            "> - Tickets are not a place for discussion or questions, if you have something to ask, please head over to questions!,\n\n"
-            "## • Application Forms\n\n"
-            "> - PGL has a various list of positions and applications to better help the league!,\n"
-            "> - These applications are looked at when needed, you will be messaged if it is accepted\n"
-            "> <#1409042394787090583>\n\n"
-            "## • Referee Rules\n\n"
-            "> - You can only ping @Scrim Referee for scrims, @Referee are only used for official matches.\n"
-            "> - Pinging @Referee for a scrim will result in a 1 day mute.\n"
-            "> - Only ping scrim refs in scrims.\n"
-            "> - Post the DATE and TIME of the scrim, along with the two teams that are playing.\n"
-            "> - DO NOT SPAM IT EVERY FEW MINUTES.\n\n"
-            "# ー Role Assign\n"
-            "> 🚀 **Unborn Captain** ー Allows you to apply your team to participate in the league!\n"
-            "> 🎉 **Event Ping** ー Participate in events! (Will receive pings)\n"
-            "> 🦓 **Scrim Referee** - Participate in scrims by being a referee! (Will receive pings)\n"
-        )
-
-        view = FAQBracketCog.FAQRoleView()
-
-        try:
-            await channel.send(content, view=view)
-            await interaction.response.send_message(f"FAQ posted in {channel.mention}.", ephemeral=True)
-        except Exception:
-            await interaction.response.send_message("Failed to post FAQ (check bot permissions).", ephemeral=True)
-
-
 class BracketAdmin(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -5270,7 +5742,7 @@ class BracketAdmin(commands.Cog):
         await interaction.followup.send("\n".join(summary), ephemeral=True)
 
 # ------------------------------ Auto-disband losing teams in single elimination -----------------------
-SINGLE_ELIM = True  # set True for this season
+SINGLE_ELIM = False  # set True for this season
 
 class AutoDisbandScrim(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -5348,7 +5820,7 @@ class AutoDisbandScrim(commands.Cog):
         protected = {
             CAPTAIN_ROLE_ID, CO_CAPTAIN_ROLE_ID, TEAM_PLAYER_ROLE_ID, TEAM_EXEC_ROLE_ID,
             HEAD_REF_ROLE_ID, REF_ROLE_ID, HEAD_CASTER_ROLE_ID, CASTER_ROLE_ID,
-            UNBORN_CAPTAIN_ROLE_ID, EVENT_PING_ROLE_ID,
+            STREAM_WATCHER_ROLE_ID, UNBORN_CAPTAIN_ROLE_ID, EVENT_PING_ROLE_ID,
         }
         if loser_role.id in protected or loser_role.is_default() or loser_role.managed:
             return
@@ -5396,6 +5868,249 @@ class AutoDisbandScrim(commands.Cog):
 
 
 
+
+
+class ServerStatsCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        # cache: guild_id -> (category_id, member_ch_id, team_ch_id, online_ch_id)
+        self._cache: dict[int, tuple[int, int, int, int]] = {}
+        self.update_stats_task.start()
+
+    def cog_unload(self):
+        self.update_stats_task.cancel()
+
+    async def _ensure_structure(self, guild: discord.Guild):
+        """
+        Create (if missing) the stats category and the three channels:
+        - 👥 | MEMBERS: N
+        - 🛡️ | TEAMS: N
+        - 🟢 | ONLINE: N
+        Then cache their IDs.
+        """
+        cat_name = "📊 SERVER STATS 📊"
+        member_prefix = "👥 | MEMBERS"
+        team_prefix = "🛡️ | TEAMS"
+        online_prefix = "🟢 | ONLINE"
+
+        category = discord.utils.get(guild.categories, name=cat_name)
+        if category is None:
+            category = await guild.create_category_channel(
+                cat_name,
+                reason="Create server stats category",
+            )
+
+        # best-effort: put category at top
+        try:
+            await category.edit(position=0)
+        except Exception:
+            pass
+
+        # STRONG read-only overwrites
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(
+                view_channel=False,
+                send_messages=False,
+                send_messages_in_threads=False,
+                create_public_threads=False,
+                create_private_threads=False,
+                add_reactions=False,
+                connect=False,
+                speak=False,
+            )
+        }
+
+        # member stats channel
+        member_ch = discord.utils.find(
+            lambda c: isinstance(c, discord.TextChannel) and c.name.startswith(member_prefix),
+            category.channels,
+        )
+        if member_ch is None:
+            member_ch = await guild.create_text_channel(
+                f"{member_prefix}: 0",
+                category=category,
+                overwrites=overwrites,
+                reason="Create member stats channel",
+            )
+
+        # team stats channel
+        team_ch = discord.utils.find(
+            lambda c: isinstance(c, discord.TextChannel) and c.name.startswith(team_prefix),
+            category.channels,
+        )
+        if team_ch is None:
+            team_ch = await guild.create_text_channel(
+                f"{team_prefix}: 0",
+                category=category,
+                overwrites=overwrites,
+                reason="Create team stats channel",
+            )
+
+        # online members channel
+        online_ch = discord.utils.find(
+            lambda c: isinstance(c, discord.TextChannel) and c.name.startswith(online_prefix),
+            category.channels,
+        )
+        if online_ch is None:
+            online_ch = await guild.create_text_channel(
+                f"{online_prefix}: 0",
+                category=category,
+                overwrites=overwrites,
+                reason="Create online members stats channel",
+            )
+
+        # enforce overwrites best-effort
+        for ch in (member_ch, team_ch, online_ch):
+            try:
+                await ch.edit(overwrites=overwrites, category=category)
+            except Exception:
+                pass
+
+        self._cache[guild.id] = (category.id, member_ch.id, team_ch.id, online_ch.id)
+
+    async def _compute_team_count_from_transactions(self, guild: discord.Guild) -> int:
+        """
+        Count unique team roles by reading the transactions channel and
+        looking for 'New Team Created!' logs with role mentions.
+        """
+        ch = guild.get_channel(TRANSACTIONS_CHANNEL_ID)
+        if not isinstance(ch, discord.TextChannel):
+            return 0
+
+        seen_role_ids: set[int] = set()
+
+        try:
+            async for msg in ch.history(limit=500):
+                if msg.author != self.bot.user:
+                    continue
+                if "New Team Created!" not in (msg.content or ""):
+                    continue
+
+                for role in msg.role_mentions:
+                    if role and not role.is_default() and not role.managed:
+                        seen_role_ids.add(role.id)
+        except Exception:
+            pass
+
+        valid_count = 0
+        for rid in seen_role_ids:
+            if guild.get_role(rid) is not None:
+                valid_count += 1
+
+        return valid_count
+
+    def _compute_online_count(self, guild: discord.Guild) -> int:
+        """
+        Count online members (including bots) using presence.
+        Requires INTENTS.presences = True and presence intent enabled.
+        """
+        online_statuses = {
+            discord.Status.online,
+            discord.Status.idle,
+            discord.Status.dnd,
+        }
+        count = 0
+        for m in guild.members:
+            if getattr(m, "status", discord.Status.offline) in online_statuses:
+                count += 1
+        return count
+
+    async def _update_names(self, guild: discord.Guild):
+        """Only renames the three channels. Does NOT create anything."""
+        ids = self._cache.get(guild.id)
+        if not ids:
+            return
+        _, member_id, team_id, online_id = ids
+
+        member_ch = guild.get_channel(member_id)
+        team_ch = guild.get_channel(team_id)
+        online_ch = guild.get_channel(online_id)
+
+        if not isinstance(member_ch, discord.TextChannel):
+            return
+        if not isinstance(team_ch, discord.TextChannel):
+            return
+        if not isinstance(online_ch, discord.TextChannel):
+            return
+
+        # member count
+        member_count = guild.member_count or 0
+        cache_count = len(guild.members)
+        if cache_count > member_count:
+            member_count = cache_count
+
+        # team count from transactions channel
+        valid_team_count = await self._compute_team_count_from_transactions(guild)
+
+        # online (non-bot) members
+        online_count = self._compute_online_count(guild)
+
+        desired_member_name = f"👥 | MEMBERS: {member_count}"
+        desired_team_name = f"🛡️ | TEAMS: {valid_team_count}"
+        desired_online_name = f"🟢 | ONLINE: {online_count}"
+
+        me = guild.me
+        if not me or not me.guild_permissions.manage_channels:
+            return
+
+        try:
+            if member_ch.name != desired_member_name:
+                await member_ch.edit(name=desired_member_name)
+        except Exception:
+            pass
+
+        try:
+            if team_ch.name != desired_team_name:
+                await team_ch.edit(name=desired_team_name)
+        except Exception:
+            pass
+
+        try:
+            if online_ch.name != desired_online_name:
+                await online_ch.edit(name=desired_online_name)
+        except Exception:
+            pass
+
+    @tasks.loop(minutes=1)
+    async def update_stats_task(self):
+        await self.bot.wait_until_ready()
+        for g in self.bot.guilds:
+            if g.id not in self._cache:
+                try:
+                    await self._ensure_structure(g)
+                except Exception:
+                    continue
+            try:
+                await self._update_names(g)
+            except Exception:
+                continue
+
+    @update_stats_task.before_loop
+    async def before_update_stats(self):
+        await self.bot.wait_until_ready()
+        for g in self.bot.guilds:
+            try:
+                await self._ensure_structure(g)
+            except Exception:
+                continue
+
+    async def update_now(self):
+        """Immediately update stats for all guilds (can be called after team changes)."""
+        await self.bot.wait_until_ready()
+        for g in self.bot.guilds:
+            if g.id not in self._cache:
+                try:
+                    await self._ensure_structure(g)
+                except Exception:
+                    continue
+            try:
+                await self._update_names(g)
+            except Exception:
+                continue
+
+
+
+
 # --------------------  CommandGuideCog ----------------------
 class CommandGuideCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -5423,7 +6138,7 @@ class CommandGuideCog(commands.Cog):
                     if not msg.embeds:
                         continue
                     emb = msg.embeds[0]
-                    if (emb.title or "").strip().lower() == "PGL command guide":
+                    if (emb.title or "").strip().lower() == "mmm command guide":
                         already = True
                         break
             except Exception:
@@ -5481,6 +6196,7 @@ class CommandGuideCog(commands.Cog):
             staff_value = (
                 ".!saysmth / !saysmth - Admin-only utility to send a message (with pings) "
                 "to any channel by ID.\n"
+                "!headsets - View the list of allowed VR headsets (but it is public so everyone can see it)"
             )
             embed.add_field(name="🧰 Staff Utility", value=staff_value, inline=False)
 
@@ -5492,161 +6208,213 @@ class CommandGuideCog(commands.Cog):
                 continue
 
 
+class TeamRoleAutoOrderCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self._task.start()
+
+    def cog_unload(self):
+        self._task.cancel()
+
+    def _get_team_roles(self, guild: discord.Guild) -> list[discord.Role]:
+        """
+        Return all team roles that should be auto‑ordered, based on teams.json.
+
+        For each entry:
+        - Try to resolve by role_id.
+        - If that fails, fall back to resolving by name (case‑insensitive).
+        """
+        roles: list[discord.Role] = []
+        seen_ids: set[int] = set()
+
+        try:
+            teams = load_teams()
+        except Exception:
+            teams = []
+
+        for entry in teams:
+            rid = entry.get("role_id")
+            name = (entry.get("name") or "").strip()
+            role: discord.Role | None = None
+
+            # 1) Try by ID
+            if rid is not None:
+                try:
+                    rid_int = int(rid)
+                except (TypeError, ValueError):
+                    print(f"[TeamRoleAutoOrder] Invalid role_id in teams.json: {rid!r}")
+                    rid_int = None
+
+                if rid_int is not None:
+                    r = guild.get_role(rid_int)
+                    if r is None:
+                        print(f"[TeamRoleAutoOrder] Role id {rid_int} not found in guild {guild.id}")
+                    else:
+                        role = r
+
+            # 2) If not found by ID, try by name
+            if role is None and name:
+                r = (
+                    discord.utils.get(guild.roles, name=name)
+                    or discord.utils.find(lambda rr: rr.name.lower() == name.lower(), guild.roles)
+                )
+                if r:
+                    print(f"[TeamRoleAutoOrder] Matched team '{name}' by name to role id {r.id}")
+                    role = r
+
+            if role is None:
+                continue
+            if role.is_default() or role.managed:
+                print(f"[TeamRoleAutoOrder] Skipping managed/default role {role} ({role.id})")
+                continue
+            if role.id in seen_ids:
+                continue
+
+            seen_ids.add(role.id)
+            roles.append(role)
+
+        # Sort team roles by name so they appear in a clean, stable order
+        roles.sort(key=lambda r: r.name.lower())
+        return roles
+
+    async def _fix_roles_for_guild(self, guild: discord.Guild):
+        team_player_role = guild.get_role(TEAM_PLAYER_ROLE_ID)
+        if team_player_role is None:
+            return
+
+        me = guild.me
+        if not me or not me.guild_permissions.manage_roles:
+            return
+
+        team_roles = self._get_team_roles(guild)
+        if not team_roles:
+            return
+
+        # DEBUG: see which roles are being moved
+        debug_names = ", ".join(f"{r.name}({r.id})" for r in team_roles)
+        print(f"[TeamRoleAutoOrder] Guild {guild.id} team roles (ordered): {debug_names}")
+
+        # Put first team role just under Team Player, others stacked directly under it
+        # This guarantees a contiguous block: TEAM PLAYER, TEST1, TEST2, ... with no non‑team roles in between.
+        top_position = team_player_role.position - 1
+        if top_position < 1:
+            top_position = 1
+
+        role_positions: dict[discord.Role, int] = {}
+        current_pos = top_position
+        for r in team_roles:
+            role_positions[r] = current_pos
+            current_pos -= 1
+            if current_pos < 1:
+                current_pos = 1
+
+        try:
+            await guild.edit_role_positions(positions=role_positions)
+        except Exception as e:
+            print(f"[TeamRoleAutoOrder] edit_role_positions failed in guild {guild.id}: {e}")
+
+    @tasks.loop(minutes=2)
+    async def _task(self):
+        await self.bot.wait_until_ready()
+        for g in self.bot.guilds:
+            try:
+                await self._fix_roles_for_guild(g)
+            except Exception as e:
+                print(f"[TeamRoleAutoOrder] _fix_roles_for_guild error in {g.id}: {e}")
+                continue
+
+    @_task.before_loop
+    async def _before(self):
+        await self.bot.wait_until_ready()
+
+    # -------- /debug-teams (admin) --------
+    @app_commands.guilds(Object(id=TEST_GUILD_ID))
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.command(
+        name="debug-teams",
+        description="Show which roles the bot thinks are team roles (for ordering).",
+    )
+    async def debug_teams(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            return
+
+        team_roles = self._get_team_roles(guild)
+        if not team_roles:
+            await interaction.response.send_message("No team roles detected.", ephemeral=True)
+            return
+
+        lines = ["Detected team roles (from teams.json):"]
+        for r in team_roles:
+            lines.append(f"- {r.name} ({r.id}) position={r.position}")
+
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
-
-class ForfeitCog(commands.Cog):
+class RoleOrderFixCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    # Small helper to extract team names from a match channel
-    def _extract_teams_from_channel(self, ch: discord.TextChannel) -> tuple[Optional[str], Optional[str]]:
-        """
-        Try to get 'Team1' and 'Team2' from channel name/topic like 'team1-vs-team2'
-        or topic 'Team1 Vs Team2'.
-        """
-        name = ch.name or ""
-        topic = ch.topic or ""
-
-        # Try topic "Team1 Vs Team2"
-        if topic and " Vs " in topic:
-            parts = topic.split(" Vs ", 1)
-            if len(parts) == 2:
-                return parts[0].strip(), parts[1].strip()
-
-        # Fallback: channel name "team1-vs-team2"
-        lower_name = name.lower()
-        if "-vs-" in lower_name:
-            p1, p2 = lower_name.split("-vs-", 1)
-            t1 = p1.replace("-", " ").strip()
-            t2 = p2.replace("-", " ").strip()
-            return t1 or None, t2 or None
-
-        return None, None
-
-    def _is_team_staff(self, member: discord.Member) -> bool:
-        return any(
-            has_role_id(member, rid)
-            for rid in (CAPTAIN_ROLE_ID, CO_CAPTAIN_ROLE_ID, TEAM_EXEC_ROLE_ID)
-        )
-
     @app_commands.guilds(Object(id=TEST_GUILD_ID))
+    @app_commands.default_permissions(administrator=True)
     @app_commands.command(
-        name="forfeit",
-        description="Forfeit the current match (captains/co-captains/executives only).",
+        name="fix-team-order",
+        description="Force one role directly under another (admins only).",
     )
-    async def forfeit(self, interaction: discord.Interaction):
+    @app_commands.describe(
+        above="Role that should be ABOVE",
+        below="Role that should be directly BELOW the above role",
+    )
+    async def fix_team_order(
+        self,
+        interaction: discord.Interaction,
+        above: discord.Role,
+        below: discord.Role,
+    ):
         guild = interaction.guild
-        ch = interaction.channel
-
-        if guild is None or not isinstance(ch, discord.TextChannel):
+        if guild is None:
             await interaction.response.send_message(
-                "Use this in a server text channel.",
+                "Use this in a server.",
                 ephemeral=True,
             )
             return
 
-        member = guild.get_member(interaction.user.id)
-        if member is None:
+        me = guild.me
+        if not me or not me.guild_permissions.manage_roles:
             await interaction.response.send_message(
-                "Could not resolve your member object.",
+                "I don't have Manage Roles permission.",
                 ephemeral=True,
             )
             return
 
-        # Check permissions: captain / co-captain / executive
-        if not self._is_team_staff(member):
+        # Bot cannot move roles at or above its highest role
+        top_bot_role = max(me.roles, key=lambda r: r.position, default=None)
+        if top_bot_role and (above.position >= top_bot_role.position or below.position >= top_bot_role.position):
             await interaction.response.send_message(
-                "Only captains, co-captains, or executives can forfeit.",
+                "I can't move these roles because they are at or above my highest role.",
                 ephemeral=True,
             )
             return
 
-        # Find the member's team
-        team_role = get_user_team_role(member)
-        if team_role is None:
-            await interaction.response.send_message(
-                "You are not on a team.",
-                ephemeral=True,
-            )
-            return
+        # We want BELOW to end up exactly one step under ABOVE
+        target_pos = above.position - 1
+        if target_pos < 1:
+            target_pos = 1
 
-        my_team_name = team_role.name
-
-        # Extract channel teams
-        t1_name, t2_name = self._extract_teams_from_channel(ch)
-        if not t1_name or not t2_name:
-            await interaction.response.send_message(
-                "Could not determine both teams from this channel. Make sure you use /forfeit in the match/scheduling channel.",
-                ephemeral=True,
-            )
-            return
-
-        # Normalize for comparison
-        t1_l = t1_name.lower()
-        t2_l = t2_name.lower()
-        my_l = my_team_name.lower()
-
-        if my_l == t1_l:
-            forfeiting_team = t1_name
-            other_team = t2_name
-        elif my_l == t2_l:
-            forfeiting_team = t2_name
-            other_team = t1_name
-        else:
-            # Try resolving via roles if names don't match exactly
-            t1_role, _, _ = resolve_team_any(guild, t1_name)
-            t2_role, _, _ = resolve_team_any(guild, t2_name)
-
-            if t1_role and t1_role.id == team_role.id:
-                forfeiting_team = t1_name
-                other_team = t2_name
-            elif t2_role and t2_role.id == team_role.id:
-                forfeiting_team = t2_name
-                other_team = t1_name
-            else:
-                await interaction.response.send_message(
-                    "Your team does not appear to be one of the teams in this channel.",
-                    ephemeral=True,
-                )
-                return
-
-        # Order them for the header line
-        team1_display = t1_name
-        team2_display = t2_name
-
-        winner_name = other_team
-        loser_name = forfeiting_team
-
-        score_ch = guild.get_channel(MATCH_SCORE_CHANNEL_ID)
-        if not isinstance(score_ch, discord.TextChannel):
-            await interaction.response.send_message(
-                "Match score channel is not configured.",
-                ephemeral=True,
-            )
-            return
-
-        # Score message formatted to match your other tools
-        score_msg = (
-            f"{team1_display} vs {team2_display}\n"
-            f"> Winner: {winner_name}\n"
-            f"> Score: 0-0\n"
-            f"> Timecap: no\n"
-            f"> Loser: {loser_name}"
-        )
+        positions = {below: target_pos}
 
         try:
-            await score_ch.send(score_msg)
-            await score_ch.send(f"{loser_name} forfeited.")
-        except Exception:
+            await guild.edit_role_positions(positions=positions)
+        except Exception as e:
             await interaction.response.send_message(
-                "Failed to submit forfeit score (check bot permissions).",
+                f"Failed to move roles: {e}",
                 ephemeral=True,
             )
             return
 
         await interaction.response.send_message(
-            f"You forfeited the match. Winner: **{winner_name}**.",
+            f"Moved {below.mention} directly under {above.mention}.",
             ephemeral=True,
         )
 
@@ -5756,6 +6524,67 @@ class RescrimCog(commands.Cog):
 
 
 
+
+@app_commands.command(name="scan-teams", description="Admin: register existing team roles into teams.json")
+@app_commands.default_permissions(administrator=True)
+async def scan_teams(interaction: discord.Interaction):
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message("Use this in a server.", ephemeral=True)
+        return
+
+    team_roles = []
+    for role in guild.roles:
+        if role.is_default() or role.managed:
+            continue
+        # skip obvious non-team roles
+        if role.id in {
+            HEAD_REF_ROLE_ID, REF_ROLE_ID,
+            HEAD_CASTER_ROLE_ID, CASTER_ROLE_ID,
+            CAPTAIN_ROLE_ID, CO_CAPTAIN_ROLE_ID,
+            TEAM_PLAYER_ROLE_ID, TEAM_EXEC_ROLE_ID,
+            BOARD_OF_DIRECTORS_ROLE_ID, COMMUNITY_MANAGER_ROLE_ID,
+            SUPERVISOR_ROLE_ID, DEVELOPMENT_TEAM_ROLE_ID,
+            STREAM_WATCHER_ROLE_ID, UNBORN_CAPTAIN_ROLE_ID,
+            EVENT_PING_ROLE_ID, SCRIM_REFEREE_ROLE_ID,
+        }:
+            continue
+        # Example rule: require "team" in name; adjust if needed
+        if "team" in role.name.lower():
+            team_roles.append(role)
+
+    if not team_roles:
+        await interaction.response.send_message("No candidate team roles found by scan.", ephemeral=True)
+        return
+
+    existing = []
+    if TEAMS_FILE.is_file():
+        try:
+            existing = json.loads(TEAMS_FILE.read_text("utf-8"))
+        except Exception:
+            existing = []
+    if not isinstance(existing, list):
+        existing = []
+
+    for r in team_roles:
+        if not any(str(e.get("role_id")) == str(r.id) for e in existing):
+            existing.append({"role_id": r.id, "name": r.name})
+
+    try:
+        TEAMS_FILE.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    except Exception as e:
+        await interaction.response.send_message(f"Failed to write teams.json: `{e}`", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        f"Registered {len(team_roles)} team role(s) into teams.json.",
+        ephemeral=True,
+    )
+
+
+
+
+
 # ---------------- Admin command: delete scheduling channels ----------------
 class SchedulingAdmin(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -5804,7 +6633,6 @@ class SchedulingAdmin(commands.Cog):
         except Exception:
             pass
 
-
 # ---------------- BOT SETUP ----------------
 class MainBot(commands.Bot):
     def __init__(self):
@@ -5813,12 +6641,13 @@ class MainBot(commands.Bot):
 
     async def setup_hook(self):
         guild_obj = Object(id=TEST_GUILD_ID)
+
         cog_names = [
             "SettingsCog",
             "AdminPanel",
             "ManageTeam",
             "DoneCommand",
-            "RosterCog",          # <-- this must match the class name above
+            "RosterCog",
             "InfoCommands",
             "AdminManage",
             "FAQBracketCog",
@@ -5832,11 +6661,11 @@ class MainBot(commands.Bot):
             "CommandGuideCog",
             "AutoCodeCog",
             "HeadsetInfoCog",
+            "ServerStatsCog",
+            "TeamRoleAutoOrderCog",
             "RescrimCog",
-            "ScrimCheckCog",
-            "ForfeitCog",
+            "RoleOrderFixCog",
         ]
-
         for name in cog_names:
             cls = globals().get(name)
             if cls is None:
@@ -5850,25 +6679,70 @@ class MainBot(commands.Bot):
                 traceback.print_exc()
                 print(f"Failed to add cog: {name}")
 
-        try:
-            await self.tree.sync(guild=guild_obj)
-            print("Commands synced.")
-        except Exception:
-            import traceback
-            traceback.print_exc()
-            print("Failed to sync commands.")
-
-
 
 bot = MainBot()
 
+web_api_started = False
+
 @bot.event
 async def on_ready():
-    for match_id, assignment in MATCHES.items():
-        bot.add_view(
-            AssignmentClaimView(match_id),
-            message_id=assignment.assignments_message_id,
-        )
+    global web_api_started
+
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+
+    # Do slow Discord stuff AFTER the API starts
+    print("Loading guild members once...")
+    try:
+        for guild in bot.guilds:
+            await guild.chunk(cache=True)
+        print("Finished loading guild members.")
+    except Exception as e:
+        print("Failed to load guild members:", repr(e))
+
+@bot.listen("on_message")
+async def standings_on_message(message: discord.Message):
+    if message.author and message.author.bot:
+        return
+
+    if message.channel and getattr(message.channel, "id", None) == STANDINGS_CHANNEL_ID:
+        await _update_standings_from_message(message)
+
+
+@bot.listen("on_message_edit")
+async def standings_on_message_edit(before: discord.Message, after: discord.Message):
+    if after.channel and getattr(after.channel, "id", None) == STANDINGS_CHANNEL_ID:
+        await _update_standings_from_message(after)
+
+
+@bot.listen("on_guild_channel_pins_update")
+async def standings_on_guild_channel_pins_update(channel: discord.abc.GuildChannel, last_pin):
+    if getattr(channel, "id", None) != STANDINGS_CHANNEL_ID:
+        return
+
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    msg = None
+
+    try:
+        pinned = await channel.pins()
+        if pinned:
+            pinned.sort(key=lambda m: m.created_at, reverse=True)
+            msg = pinned[0]
+    except Exception as e:
+        print("Warning: failed to read standings pins:", repr(e))
+
+    if msg is None:
+        try:
+            async for m in channel.history(limit=1):
+                msg = m
+                break
+        except Exception as e:
+            print("Warning: failed to read latest standings message:", repr(e))
+
+    if msg:
+        await _update_standings_from_message(msg)
+
 
 if __name__ == "__main__":
     bot.run(os.getenv("BOT_TOKEN"))
