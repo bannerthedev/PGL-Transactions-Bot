@@ -4874,148 +4874,6 @@ class ForceTimeCog(commands.Cog):
 
 
 
-
-
-# ---------------- Allowed Headsets Cog ---------------------
-class HeadsetInfoCog(commands.Cog):
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
-
-    # ---------- shared embed builder ----------
-    def _build_headset_embed(self) -> discord.Embed:
-        headsets = load_headsets()
-        lines = ["Allowed Headsets:"]
-        for h in headsets:
-            lines.append(f"• {h}")
-
-        desc = (
-            "Note: No other VR headsets are allowed in competition beyond the list below.\n\n"
-            + "\n".join(lines)
-        )
-
-        embed = discord.Embed(
-            title="Allowed VR Headsets",
-            description=desc,
-            color=discord.Color.blue(),
-        )
-        return embed
-
-    # ---------- Prefix command: !headsets (public) ----------
-    @commands.command(name="headsets")
-    async def headsets_prefix(self, ctx: commands.Context):
-        embed = self._build_headset_embed()
-
-        # delete the user’s command message (optional but you requested earlier)
-        try:
-            await ctx.message.delete()
-        except Exception:
-            pass
-
-        try:
-            await ctx.send(embed=embed)
-        except Exception:
-            pass
-
-    # ---------- Slash command: /headsets (ephemeral) ----------
-    @app_commands.guilds(Object(id=TEST_GUILD_ID))
-    @app_commands.command(
-        name="headsets",
-        description="View the list of allowed VR headsets (competition).",
-    )
-    async def headsets_slash(self, interaction: discord.Interaction):
-        embed = self._build_headset_embed()
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    # ---------- /edit-headsets (admin only) ----------
-    @app_commands.guilds(Object(id=TEST_GUILD_ID))
-    @app_commands.default_permissions(administrator=True)
-    @app_commands.command(
-        name="edit-headsets",
-        description="Add or remove allowed headsets (admins only).",
-    )
-    async def edit_headsets(self, interaction: discord.Interaction):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
-            return
-
-        view = self.EditHeadsetsView()
-        await interaction.response.send_message("Choose an action:", view=view, ephemeral=True)
-
-    # ---------- inner UI classes ----------
-    class EditHeadsetsView(discord.ui.View):
-        def __init__(self):
-            super().__init__(timeout=60)
-            options = [
-                discord.SelectOption(label="Add", description="Add a headset to the allowed list.", value="add"),
-                discord.SelectOption(label="Remove", description="Remove a headset from the allowed list.", value="remove"),
-            ]
-            self.select = discord.ui.Select(placeholder="Select an action", min_values=1, max_values=1, options=options)
-            self.select.callback = self._on_select
-            self.add_item(self.select)
-
-        async def _on_select(self, interaction: discord.Interaction):
-            choice = interaction.data["values"][0]
-            if choice == "add":
-                modal = HeadsetInfoCog.AddHeadsetModal()
-                await interaction.response.send_modal(modal)
-            elif choice == "remove":
-                modal = HeadsetInfoCog.RemoveHeadsetModal()
-                await interaction.response.send_modal(modal)
-
-    class AddHeadsetModal(discord.ui.Modal, title="Add Allowed Headset"):
-        name = discord.ui.TextInput(
-            label="What are you adding?",
-            placeholder="e.g. Valve Index",
-            required=True,
-            max_length=100,
-        )
-
-        async def on_submit(self, interaction: discord.Interaction):
-            raw = self.name.value.strip()
-            if not raw:
-                await interaction.response.send_message("You must provide a name.", ephemeral=True)
-                return
-
-            headsets = load_headsets()
-            # case-insensitive duplicate check
-            existing_lower = {h.lower() for h in headsets}
-            if raw.lower() in existing_lower:
-                await interaction.response.send_message(f"`{raw}` is already in the allowed list.", ephemeral=True)
-                return
-
-            headsets.append(raw)
-            save_headsets(headsets)
-            await interaction.response.send_message(f"Added `{raw}` to the allowed headsets.", ephemeral=True)
-
-    class RemoveHeadsetModal(discord.ui.Modal, title="Remove Allowed Headset"):
-        name = discord.ui.TextInput(
-            label="What are you removing?",
-            placeholder="Exact name, e.g. Valve Index",
-            required=True,
-            max_length=100,
-        )
-
-        async def on_submit(self, interaction: discord.Interaction):
-            raw = self.name.value.strip()
-            if not raw:
-                await interaction.response.send_message("You must provide a name.", ephemeral=True)
-                return
-
-            headsets = load_headsets()
-            # remove any that match case-insensitively
-            to_remove_lower = raw.lower()
-            new_list = [h for h in headsets if h.lower() != to_remove_lower]
-
-            if len(new_list) == len(headsets):
-                await interaction.response.send_message(f"`{raw}` was not found in the allowed list.", ephemeral=True)
-                return
-
-            save_headsets(new_list)
-            await interaction.response.send_message(f"Removed `{raw}` from the allowed headsets.", ephemeral=True)
-
-
-
-
 # ---------------- Settings / Manage / Done / Roster / Info / AdminManage / FAQ+Bracket ----------------
 class SettingsCog(commands.Cog):
     def __init__(self, bot):
@@ -5541,7 +5399,6 @@ class InfoCommands(commands.Cog):
         embed.add_field(name="/start-seeding", value="Enable /standing", inline=False)
         embed.add_field(name="/end-seeding", value="Disable /standing", inline=False)
         embed.add_field(name="/delete-scheduling", value="Delete all scheduling channels (name contains -vs-)", inline=False)
-        embed.add_field(name="/faq", value="Post the FAQ + role buttons.", inline=False)
         embed.add_field(name="/force-time", value="Propose a forced match time between two teams.", inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -6179,7 +6036,6 @@ class CommandGuideCog(commands.Cog):
                 "/standing - View league standings (only when seeding is enabled).\n"
                 "/list-teams - Lists all registered teams.\n"
                 "/player-info - Shows a player's current team and past teams.\n"
-                "/headsets - View the list of allowed VR headsets (only you can see it)"
             )
             embed.add_field(name="👤 Everyone", value=everyone_value, inline=False)
 
@@ -6204,7 +6060,6 @@ class CommandGuideCog(commands.Cog):
                 "/start-seeding - Enable standings and seeding logic.\n"
                 "/end-seeding - Disable standings and end seeding.\n"
                 "/delete-scheduling - Delete all scheduling channels (-vs-).\n"
-                "/faq - Post the FAQ + role buttons.\n"
                 "/force-time - Propose a forced match time between two teams.\n"
             )
             embed.add_field(name="🔧 Administrators", value=admin_value, inline=False)
@@ -6213,7 +6068,6 @@ class CommandGuideCog(commands.Cog):
             staff_value = (
                 ".!saysmth / !saysmth - Admin-only utility to send a message (with pings) "
                 "to any channel by ID.\n"
-                "!headsets - View the list of allowed VR headsets (but it is public so everyone can see it)"
             )
             embed.add_field(name="🧰 Staff Utility", value=staff_value, inline=False)
 
