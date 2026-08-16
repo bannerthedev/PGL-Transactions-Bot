@@ -650,6 +650,20 @@ async def _populate_initial_standings_cache():
 
 
 
+def add_team_to_list(role_id: int, name: str):
+    data = load_teams()
+    for entry in data:
+        if str(entry.get("role_id")) == str(role_id):
+            entry["name"] = name
+            break
+    else:
+        data.append({"role_id": role_id, "name": name})
+    try:
+        with TEAMS_FILE.open("w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        return
+
 def load_player_history() -> dict:
     if not PLAYER_HISTORY_FILE.is_file():
         return {}
