@@ -75,6 +75,29 @@ BRACKET_BASE_IMAGE_PATH = "MMM BRACKET.png"
 BRACKET_OUTPUT_IMAGE_PATH = "MMM_BRACKET_FILLED.png"
 
 
+
+EXECUTIVE_ROLE_NAME = "Team-Executive"
+
+NON_TEAM_ROLE_NAMES = {
+    "@everyone",
+    "Executive",
+    "Admin",
+    "Administrator",
+    "Moderator",
+    "Mod",
+    "Staff",
+    "Owner",
+    "Captain",
+    "Co-Captain",
+    "Co Captain",
+    "Bot",
+    "Bots",
+    "Muted",
+    "Verified",
+}
+
+
+
 ROSTER_LOCKED = False
 SEEDING_OPEN = False
 FORCE_WARN_DAYS = 4
@@ -98,7 +121,6 @@ DEFAULT_CONFIG = {
         "team_member": TEAM_PLAYER_ROLE_ID,
         "caster": CASTER_ROLE_ID,
         "referee": REF_ROLE_ID,
-        "stream_watcher": STREAM_WATCHER_ROLE_ID,
     },
     "roster_rules": {
         "max_roster": 12,
@@ -695,8 +717,6 @@ async def scan_teams(interaction: discord.Interaction):
             TEAM_PLAYER_ROLE_ID, TEAM_EXEC_ROLE_ID,
             BOARD_OF_DIRECTORS_ROLE_ID, COMMUNITY_MANAGER_ROLE_ID,
             SUPERVISOR_ROLE_ID, DEVELOPMENT_TEAM_ROLE_ID,
-            STREAM_WATCHER_ROLE_ID, UNBORN_CAPTAIN_ROLE_ID,
-            EVENT_PING_ROLE_ID, SCRIM_REFEREE_ROLE_ID,
         }:
             continue
         # simple rule: name contains "team" (adjust as needed)
@@ -740,7 +760,6 @@ def is_team_role(guild: discord.Guild, role: discord.Role) -> bool:
     protected = {
         CAPTAIN_ROLE_ID, CO_CAPTAIN_ROLE_ID, TEAM_PLAYER_ROLE_ID, TEAM_EXEC_ROLE_ID,
         HEAD_REF_ROLE_ID, REF_ROLE_ID, HEAD_CASTER_ROLE_ID, CASTER_ROLE_ID,
-        STREAM_WATCHER_ROLE_ID, UNBORN_CAPTAIN_ROLE_ID, EVENT_PING_ROLE_ID,
     }
     if role.is_default() or role.managed or role.id in protected:
         return False
@@ -1144,7 +1163,6 @@ class DisbandTeamModal(discord.ui.Modal, title="Disband Team"):
         protected = {
             CAPTAIN_ROLE_ID, CO_CAPTAIN_ROLE_ID, TEAM_PLAYER_ROLE_ID, TEAM_EXEC_ROLE_ID,
             HEAD_REF_ROLE_ID, REF_ROLE_ID, HEAD_CASTER_ROLE_ID, CASTER_ROLE_ID,
-            STREAM_WATCHER_ROLE_ID, UNBORN_CAPTAIN_ROLE_ID, EVENT_PING_ROLE_ID,
         }
         if team_role.id in protected or team_role.is_default() or team_role.managed:
             await interaction.response.send_message("That role cannot be disbanded.", ephemeral=True)
@@ -5820,7 +5838,6 @@ class AutoDisbandScrim(commands.Cog):
         protected = {
             CAPTAIN_ROLE_ID, CO_CAPTAIN_ROLE_ID, TEAM_PLAYER_ROLE_ID, TEAM_EXEC_ROLE_ID,
             HEAD_REF_ROLE_ID, REF_ROLE_ID, HEAD_CASTER_ROLE_ID, CASTER_ROLE_ID,
-            STREAM_WATCHER_ROLE_ID, UNBORN_CAPTAIN_ROLE_ID, EVENT_PING_ROLE_ID,
         }
         if loser_role.id in protected or loser_role.is_default() or loser_role.managed:
             return
@@ -6545,8 +6562,6 @@ async def scan_teams(interaction: discord.Interaction):
             TEAM_PLAYER_ROLE_ID, TEAM_EXEC_ROLE_ID,
             BOARD_OF_DIRECTORS_ROLE_ID, COMMUNITY_MANAGER_ROLE_ID,
             SUPERVISOR_ROLE_ID, DEVELOPMENT_TEAM_ROLE_ID,
-            STREAM_WATCHER_ROLE_ID, UNBORN_CAPTAIN_ROLE_ID,
-            EVENT_PING_ROLE_ID, SCRIM_REFEREE_ROLE_ID,
         }:
             continue
         # Example rule: require "team" in name; adjust if needed
