@@ -123,7 +123,7 @@ DEFAULT_CONFIG = {
         "referee": REF_ROLE_ID,
     },
     "roster_rules": {
-        "max_roster": 12,
+        "max_roster": 10,
         "max_co_captains": 2,
         "max_executive": 1,
     },
@@ -4902,7 +4902,7 @@ class SettingsCog(commands.Cog):
             f"Referee: {role_display('referee')}"
         )
         roster_value = (
-            f"Max Roster Size: {rr.get('max_roster', 12)}\n"
+            f"Max Roster Size: {rr.get('max_roster', 10)}\n"
             f"Max Co-Captains: {rr.get('max_co_captains', 2)}\n"
             f"Max Executive: {rr.get('max_executive', 1)}"
         )
@@ -4935,7 +4935,7 @@ class ManageTeam(commands.Cog):
 
         data = await get_team_data(team_role, guild)
 
-        max_roster = CONFIG.get("roster_rules", {}).get("max_roster", 12)
+        max_roster = CONFIG.get("roster_rules", {}).get("max_roster", 10)
         embed_color = team_role.colour if getattr(team_role, "colour", None) else discord.Color.blurple()
         embed = discord.Embed(
             title=f"Roster for {data['name']}",
@@ -5142,7 +5142,7 @@ class RosterCog(commands.Cog):
             await interaction.followup.send("No teams found.", ephemeral=True)
             return
 
-        max_roster = CONFIG.get("roster_rules", {}).get("max_roster", 12)
+        max_roster = CONFIG.get("roster_rules", {}).get("max_roster", 10)
 
         async def build_embed_for_role(role: discord.Role) -> discord.Embed:
             data = await get_team_data(role, guild)
@@ -5330,13 +5330,13 @@ class AdminManage(commands.Cog):
         embed.add_field(name="Co-Captains", value=format_list_arrow(data.get("co_captains", [])), inline=False)
 
         players = data.get("players", [])
-        player_mentions = [p.mention for p in players[:12]]
+        player_mentions = [p.mention for p in players[:10]]
         embed.add_field(name="Players", value=format_list_arrow(player_mentions), inline=False)
 
         pending = data.get("pending_invites", [])
         pending_text = ", ".join(str(x) for x in pending) if pending else "None"
         embed.add_field(name="Pending invites", value=pending_text, inline=False)
-        embed.add_field(name="\u200b", value=f"{len(players)}/12", inline=False)
+        embed.add_field(name="\u200b", value=f"{len(players)}/10", inline=False)
 
         view = ManageTeamView(
             team_role=role,
